@@ -1,0 +1,139 @@
+# MariaDB Dynatrace Observability Demo - Scheduled Workflow
+# Runs every 4 hours to generate synthetic database workloads
+#
+# Required secrets:
+#   MARIADB_HOST     - Database host (e.g., your-db.example.com)
+#   MARIADB_PORT     - Database port (default: 3306)
+#   MARIADB_USER     - Database user
+#   MARIADB_PASSWORD - Database password
+#   MARIADB_DATABASE - Database name (default: dynatrace_demo)
+
+name: MariaDB Dynatrace Demo
+
+on:
+  # Scheduled: every 4 hours
+  schedule:
+    - cron: '0 */4 * * *'  # At minute 0 of every 4th hour
+
+  # Manual trigger with options
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'Scenario to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - seed
+          - cleanup
+          - full_table_scan
+          - n_plus_1
+          - heavy_aggregation
+          - lock_contention
+          - high_frequency
+          - slow_inserts
+          - index_change
+          - mixed_oltp
+          - temp_table_filesort
+          - long_transaction
+      skip_seed:
+        description: 'Skip seeding data'
+        required: false
+        default: true
+        type: boolean
+      cleanup_before:
+        description: 'Run cleanup before scenarios'
+        required: false
+        default: true
+        type: boolean
+      cleanup_days:
+        description: 'Delete data older than N days'
+        required: false
+        default: '10'
+        type: string
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  run-demo:
+    name: Run MariaDB Demo Scenarios
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install mysql-connector-python faker
+
+      - name: Run scheduled workload (cron)
+        if: github.event_name == 'schedule'
+        env:
+          MARIADB_HOST: ${{ secrets.MARIADB_HOST }}
+          MARIADB_PORT: ${{ secrets.MARIADB_PORT }}
+          MARIADB_USER: ${{ secrets.MARIADB_USER }}
+          MARIADB_PASSWORD: ${{ secrets.MARIADB_PASSWORD }}
+          MARIADB_DATABASE: ${{ secrets.MARIADB_DATABASE }}
+        run: |
+          python mariadb_dynatrace_generator.py \
+            --host "${MARIADB_HOST:-127.0.0.1}" \
+            --port "${MARIADB_PORT:-3306}" \
+            --user "${MARIADB_USER:-root}" \
+            --password "${MARIADB_PASSWORD}" \
+            --database "${MARIADB_DATABASE:-dynatrace_demo}" \
+            --scenario all \
+            --skip-seed \
+            --cleanup-before \
+            --cleanup-days 10
+
+      - name: Run manual workload (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          MARIADB_HOST: ${{ secrets.MARIADB_HOST }}
+          MARIADB_PORT: ${{ secrets.MARIADB_PORT }}
+          MARIADB_USER: ${{ secrets.MARIADB_USER }}
+          MARIADB_PASSWORD: ${{ secrets.MARIADB_PASSWORD }}
+          MARIADB_DATABASE: ${{ secrets.MARIADB_DATABASE }}
+        run: |
+          ARGS="--host ${MARIADB_HOST:-127.0.0.1}"
+          ARGS="$ARGS --port ${MARIADB_PORT:-3306}"
+          ARGS="$ARGS --user ${MARIADB_USER:-root}"
+          ARGS="$ARGS --password ${MARIADB_PASSWORD}"
+          ARGS="$ARGS --database ${MARIADB_DATABASE:-dynatrace_demo}"
+          ARGS="$ARGS --scenario ${{ inputs.scenario }}"
+          ARGS="$ARGS --cleanup-days ${{ inputs.cleanup_days }}"
+
+          if [ "${{ inputs.skip_seed }}" == "true" ]; then
+            ARGS="$ARGS --skip-seed"
+          fi
+
+          if [ "${{ inputs.cleanup_before }}" == "true" ]; then
+            ARGS="$ARGS --cleanup-before"
+          fi
+
+          python mariadb_dynatrace_generator.py $ARGS
+
+      - name: Summary
+        run: |
+          echo "## MariaDB Dynatrace Demo Run Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Run time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "- **Scenario:** ${{ inputs.scenario }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Cleanup days:** ${{ inputs.cleanup_days }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Scenario:** all (scheduled)" >> $GITHUB_STEP_SUMMARY
+            echo "- **Cleanup days:** 10" >> $GITHUB_STEP_SUMMARY
+          fi
