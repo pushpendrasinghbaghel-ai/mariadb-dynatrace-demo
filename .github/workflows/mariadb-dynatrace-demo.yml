@@ -75,7 +75,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install mysql-connector-python faker
+          pip install -r requirements.txt
 
       - name: Run scheduled workload (cron)
         if: github.event_name == 'schedule'
