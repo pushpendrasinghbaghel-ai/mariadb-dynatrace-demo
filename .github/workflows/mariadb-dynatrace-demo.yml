@@ -76,6 +76,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Validate secrets
+        env:
+          MARIADB_HOST: ${{ secrets.MARIADB_HOST }}
+          MARIADB_PASSWORD: ${{ secrets.MARIADB_PASSWORD }}
+        run: |
+          if [ -z "${MARIADB_HOST}" ]; then
+            echo "::error::MARIADB_HOST secret is not set. Go to Settings > Secrets and add it."
+            exit 1
+          fi
+          if [ -z "${MARIADB_PASSWORD}" ]; then
+            echo "::error::MARIADB_PASSWORD secret is not set. Go to Settings > Secrets and add it."
+            exit 1
+          fi
+          echo "✔ Required secrets are configured."
+
       - name: Run scheduled workload (cron)
         if: github.event_name == 'schedule'
         env:
@@ -136,3 +151,11 @@ jobs:
             echo "- **Scenario:** all (scheduled)" >> $GITHUB_STEP_SUMMARY
             echo "- **Cleanup days:** 10" >> $GITHUB_STEP_SUMMARY
           fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Dynatrace Visibility" >> $GITHUB_STEP_SUMMARY
+          echo "Queries, statements, and EXPLAIN plans were executed against the database." >> $GITHUB_STEP_SUMMARY
+          echo "Check **Dynatrace → Databases → dynatrace_demo** to see:" >> $GITHUB_STEP_SUMMARY
+          echo "- SQL statements and their execution counts" >> $GITHUB_STEP_SUMMARY
+          echo "- Execution plans (EXPLAIN output)" >> $GITHUB_STEP_SUMMARY
+          echo "- Slow queries and full table scans" >> $GITHUB_STEP_SUMMARY
+          echo "- Lock contention and wait times" >> $GITHUB_STEP_SUMMARY

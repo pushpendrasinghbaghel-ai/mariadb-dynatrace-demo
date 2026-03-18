@@ -71,6 +71,7 @@ def execute(conn, sql, params=None, fetch=False, many=False):
         if many:
             cur.executemany(sql, params or [])
         else:
+            log.debug(f"SQL: {sql.strip()[:120]}")
             cur.execute(sql, params or ())
         if fetch:
             return cur.fetchall()
@@ -82,6 +83,27 @@ def execute(conn, sql, params=None, fetch=False, many=False):
     finally:
         cur.close()
     return []
+
+def explain_query(conn, sql, params=None):
+    """Run EXPLAIN on a query and log the execution plan.
+    This makes explain plans visible to Dynatrace DB monitoring."""
+    cur = conn.cursor(dictionary=True)
+    try:
+        explain_sql = f"EXPLAIN {sql}"
+        cur.execute(explain_sql, params or ())
+        plan = cur.fetchall()
+        for row in plan:
+            log.info(f"  EXPLAIN: table={row.get('table')} "
+                     f"type={row.get('type')} "
+                     f"key={row.get('key')} "
+                     f"rows={row.get('rows')} "
+                     f"Extra={row.get('Extra')}")
+        return plan
+    except Error as e:
+        log.debug(f"EXPLAIN error: {e}")
+        return []
+    finally:
+        cur.close()
 
 # =============================================================================
 # SCHEMA SETUP
@@ -359,6 +381,15 @@ def scenario_full_table_scan(cfg, iterations=50):
     log.info("▶ SCENARIO 1: Full table scan (no index on country/tier)")
     conn = get_connection(cfg)
     countries = ['US','GB','DE','IN','FR','JP','CA','AU','BR','MX']
+
+    # Run EXPLAIN first to capture execution plans in Dynatrace
+    log.info("  Running EXPLAIN on full-table-scan queries...")
+    explain_query(conn, "SELECT * FROM customers WHERE country = %s AND tier = %s",
+                  ('US', 'gold'))
+    explain_query(conn, "SELECT * FROM customers WHERE tier = %s ORDER BY last_name LIMIT 100",
+                  ('gold',))
+    explain_query(conn, "SELECT * FROM customers WHERE last_name LIKE %s", ('%Smith%',))
+
     for i in range(iterations):
         country = random.choice(countries)
         tier = random.choice(['gold','platinum'])
@@ -370,6 +401,10 @@ def scenario_full_table_scan(cfg, iterations=50):
         # LIKE scan — can't use index prefix
         kw = random.choice(['Smith','Johnson','Williams','Brown','Jones'])
         execute(conn, "SELECT * FROM customers WHERE last_name LIKE %s", (f'%{kw}%',), fetch=True)
+        # Periodic EXPLAIN to keep plans visible in Dynatrace
+        if i % 10 == 0:
+            explain_query(conn, "SELECT * FROM customers WHERE country = %s AND tier = %s",
+                          (country, tier))
         time.sleep(random.uniform(0.05, 0.15))
     conn.close()
     log.info("✔ Scenario 1 done.")
@@ -382,6 +417,15 @@ def scenario_full_table_scan(cfg, iterations=50):
 def scenario_n_plus_1(cfg, iterations=15):
     log.info("▶ SCENARIO 2: N+1 query pattern")
     conn = get_connection(cfg)
+
+    # EXPLAIN the N+1 pattern queries
+    log.info("  Running EXPLAIN on N+1 queries...")
+    explain_query(conn, "SELECT id, customer_id FROM orders LIMIT 50")
+    explain_query(conn, "SELECT * FROM customers WHERE id = %s", (1,))
+    explain_query(conn,
+        "SELECT oi.*, p.name FROM order_items oi JOIN products p ON p.id=oi.product_id WHERE oi.order_id = %s",
+        (1,))
+
     for _ in range(iterations):
         orders = execute(conn, "SELECT id, customer_id FROM orders LIMIT 50", fetch=True) or []
         for order in orders:
@@ -402,27 +446,36 @@ def scenario_n_plus_1(cfg, iterations=15):
 def scenario_heavy_aggregation(cfg, iterations=10):
     log.info("▶ SCENARIO 3: Heavy aggregation / reporting queries")
     conn = get_connection(cfg)
+
+    agg_sql = """
+        SELECT category, country, tier,
+               SUM(revenue) as total_revenue,
+               COUNT(DISTINCT customer_id) as unique_customers,
+               AVG(revenue) as avg_revenue,
+               sale_year, sale_month
+        FROM sales_facts
+        GROUP BY category, country, tier, sale_year, sale_month
+        ORDER BY total_revenue DESC
+        LIMIT 200
+    """
+    corr_sql = """
+        SELECT o.id, o.customer_id, o.total_amount,
+               (SELECT SUM(o2.total_amount) FROM orders o2
+                WHERE o2.customer_id = o.customer_id AND o2.id <= o.id) AS running_total
+        FROM orders o
+        ORDER BY o.customer_id, o.id
+        LIMIT 80
+    """
+
+    # EXPLAIN heavy queries so plans appear in Dynatrace
+    log.info("  Running EXPLAIN on aggregation queries...")
+    explain_query(conn, agg_sql)
+    explain_query(conn, corr_sql)
+
     for _ in range(iterations):
-        execute(conn, """
-            SELECT category, country, tier,
-                   SUM(revenue) as total_revenue,
-                   COUNT(DISTINCT customer_id) as unique_customers,
-                   AVG(revenue) as avg_revenue,
-                   sale_year, sale_month
-            FROM sales_facts
-            GROUP BY category, country, tier, sale_year, sale_month
-            ORDER BY total_revenue DESC
-            LIMIT 200
-        """, fetch=True)
+        execute(conn, agg_sql, fetch=True)
         # Correlated subquery — intentionally slow
-        execute(conn, """
-            SELECT o.id, o.customer_id, o.total_amount,
-                   (SELECT SUM(o2.total_amount) FROM orders o2
-                    WHERE o2.customer_id = o.customer_id AND o2.id <= o.id) AS running_total
-            FROM orders o
-            ORDER BY o.customer_id, o.id
-            LIMIT 80
-        """, fetch=True)
+        execute(conn, corr_sql, fetch=True)
         time.sleep(random.uniform(0.5, 1.2))
     conn.close()
     log.info("✔ Scenario 3 done.")
@@ -549,21 +602,26 @@ def scenario_slow_inserts(cfg, n=300):
 def scenario_index_change(cfg, iterations_before=20, iterations_after=20):
     log.info("▶ SCENARIO 7: Execution plan change — index added mid-run")
     conn = get_connection(cfg)
+    query = "SELECT id, email FROM customers WHERE country='US' AND tier='gold'"
     try:
         execute(conn, "ALTER TABLE customers DROP INDEX idx_demo_country_tier")
     except: pass
 
     log.info("  Phase 1: WITHOUT index (full table scan)...")
+    # EXPLAIN before index — should show type=ALL
+    explain_query(conn, query)
     for _ in range(iterations_before):
-        execute(conn, "SELECT id, email FROM customers WHERE country='US' AND tier='gold'", fetch=True)
+        execute(conn, query, fetch=True)
         time.sleep(0.1)
 
     log.info("  Adding index idx_demo_country_tier ...")
     execute(conn, "ALTER TABLE customers ADD INDEX idx_demo_country_tier (country, tier)")
 
     log.info("  Phase 2: WITH index (index range scan)...")
+    # EXPLAIN after index — should show type=ref with key=idx_demo_country_tier
+    explain_query(conn, query)
     for _ in range(iterations_after):
-        execute(conn, "SELECT id, email FROM customers WHERE country='US' AND tier='gold'", fetch=True)
+        execute(conn, query, fetch=True)
         time.sleep(0.1)
 
     execute(conn, "ALTER TABLE customers DROP INDEX idx_demo_country_tier")
@@ -635,25 +693,34 @@ def scenario_mixed_oltp(cfg, threads=8, duration_sec=60):
 def scenario_temp_table_filesort(cfg, iterations=15):
     log.info("▶ SCENARIO 9: Temp table + filesort (GROUP BY without index)")
     conn = get_connection(cfg)
+
+    join_sql = """
+        SELECT c.country, c.tier, COUNT(*) as cnt, SUM(o.total_amount) as revenue
+        FROM customers c
+        LEFT JOIN orders o ON o.customer_id = c.id
+        GROUP BY c.country, c.tier
+        ORDER BY revenue DESC
+    """
+    cat_sql = """
+        SELECT p.category,
+               COUNT(DISTINCT oi.order_id) as order_count,
+               SUM(oi.quantity) as total_qty,
+               AVG(oi.unit_price) as avg_price
+        FROM order_items oi
+        JOIN products p ON p.id = oi.product_id
+        GROUP BY p.category
+        HAVING order_count > 5
+        ORDER BY total_qty DESC
+    """
+
+    # EXPLAIN to surface Using temporary / Using filesort in Dynatrace
+    log.info("  Running EXPLAIN on temp-table/filesort queries...")
+    explain_query(conn, join_sql)
+    explain_query(conn, cat_sql)
+
     for _ in range(iterations):
-        execute(conn, """
-            SELECT c.country, c.tier, COUNT(*) as cnt, SUM(o.total_amount) as revenue
-            FROM customers c
-            LEFT JOIN orders o ON o.customer_id = c.id
-            GROUP BY c.country, c.tier
-            ORDER BY revenue DESC
-        """, fetch=True)
-        execute(conn, """
-            SELECT p.category,
-                   COUNT(DISTINCT oi.order_id) as order_count,
-                   SUM(oi.quantity) as total_qty,
-                   AVG(oi.unit_price) as avg_price
-            FROM order_items oi
-            JOIN products p ON p.id = oi.product_id
-            GROUP BY p.category
-            HAVING order_count > 5
-            ORDER BY total_qty DESC
-        """, fetch=True)
+        execute(conn, join_sql, fetch=True)
+        execute(conn, cat_sql, fetch=True)
         time.sleep(random.uniform(0.2, 0.5))
     conn.close()
     log.info("✔ Scenario 9 done.")
