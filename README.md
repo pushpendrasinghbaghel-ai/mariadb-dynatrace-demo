@@ -9,12 +9,49 @@ Generate synthetic database workloads against MariaDB to showcase Dynatrace Data
 - **Scheduled execution** — GitHub Actions workflow or systemd timer for recurring runs
 - **Seed data generation** — Creates ~2000 customers, 500 products, 5000 orders with realistic Faker data
 
+## Prerequisites — Dynatrace Visibility
+
+For SQL statements and execution plans to appear in Dynatrace Database Observability, your MariaDB instance needs:
+
+### 1. `performance_schema` enabled (server startup)
+
+Add to `my.cnf` / MariaDB config and restart:
+
+```ini
+[mysqld]
+performance_schema = ON
+```
+
+> The generator checks this automatically and warns if it's OFF.
+
+### 2. Dynatrace monitoring user
+
+```sql
+CREATE USER IF NOT EXISTS 'dynatrace'@'%' IDENTIFIED BY '<strong-password>';
+GRANT SELECT ON performance_schema.* TO 'dynatrace'@'%';
+GRANT PROCESS, REPLICATION CLIENT ON *.* TO 'dynatrace'@'%';
+GRANT SELECT ON dynatrace_demo.* TO 'dynatrace'@'%';  -- needed for EXPLAIN plans
+FLUSH PRIVILEGES;
+```
+
+### 3. Automatic setup by generator
+
+The generator automatically configures these at startup (requires a user with SUPER/admin privileges):
+
+- Enables `performance_schema` statement consumers and instruments
+- Sets `slow_query_log = ON` with `long_query_time = 0.3s`
+- Sets `log_slow_verbosity = 'query_plan,explain'` — **MariaDB-specific**, logs execution plans in the slow query log
+- Enables `userstat` for per-user/table statistics
+- Resets statement digest table for clean capture
+
+Use `--skip-monitoring-setup` to skip this configuration step.
+
 ## Quick Start
 
 ```bash
 pip install mysql-connector-python faker
 
-# Run all scenarios
+# Run all scenarios (auto-configures MariaDB for Dynatrace)
 python mariadb_dynatrace_generator.py --host 127.0.0.1 --user root --password secret
 
 # Run specific scenario
@@ -59,6 +96,7 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for:
 --cleanup-days  Delete data older than N days (default: 10)
 --cleanup-before Run cleanup before scenarios
 --cleanup-after  Run cleanup after scenarios
+--skip-monitoring-setup  Skip Dynatrace monitoring configuration
 ```
 
 ## License

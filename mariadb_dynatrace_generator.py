@@ -55,7 +55,7 @@ fake = Faker()
 # ─── DB helpers ───────────────────────────────────────────────────────────────
 
 def get_connection(cfg):
-    return mysql.connector.connect(
+    conn = mysql.connector.connect(
         host=cfg.host,
         port=cfg.port,
         user=cfg.user,
@@ -63,7 +63,16 @@ def get_connection(cfg):
         database=cfg.database,
         connection_timeout=10,
         autocommit=False,
+        use_pure=True,   # Text protocol — ensures statement text in performance_schema
     )
+    # Per-session: lower slow-query threshold so demo queries are captured
+    cur = conn.cursor()
+    try:
+        cur.execute("SET SESSION long_query_time = 0.3")
+    except Error:
+        pass
+    cur.close()
+    return conn
 
 def execute(conn, sql, params=None, fetch=False, many=False):
     cur = conn.cursor(dictionary=True)
@@ -104,6 +113,157 @@ def explain_query(conn, sql, params=None):
         return []
     finally:
         cur.close()
+
+# =============================================================================
+# DYNATRACE MONITORING SETUP
+# =============================================================================
+
+def setup_dynatrace_monitoring(cfg):
+    """
+    Configure MariaDB for Dynatrace Database Observability.
+    Ensures SQL statements appear in performance_schema and execution plans
+    are logged via slow query log with MariaDB's explain verbosity.
+    """
+    log.info("=" * 60)
+    log.info("  Configuring MariaDB for Dynatrace Observability")
+    log.info("=" * 60)
+
+    conn = mysql.connector.connect(
+        host=cfg.host, port=cfg.port,
+        user=cfg.user, password=cfg.password,
+        connection_timeout=10, use_pure=True,
+    )
+    cur = conn.cursor(dictionary=True)
+    issues = []
+
+    # ── 1. Check performance_schema (server startup variable) ────────────
+    cur.execute("SHOW VARIABLES LIKE 'performance_schema'")
+    row = cur.fetchone()
+    ps_on = row and row.get('Value', 'OFF') == 'ON'
+    if not ps_on:
+        issues.append("performance_schema is OFF")
+        log.error("✗ performance_schema is OFF!")
+        log.error("  Dynatrace CANNOT capture SQL statements or execution plans.")
+        log.error("  Fix: add to [mysqld] in my.cnf / server config and restart:")
+        log.error("    performance_schema = ON")
+    else:
+        log.info("  ✓ performance_schema = ON")
+
+    # ── 2. Enable statement consumers + instruments (dynamic) ───────────
+    if ps_on:
+        consumers = [
+            'events_statements_current',
+            'events_statements_history',
+            'events_statements_history_long',
+            'statements_digest',
+        ]
+        for name in consumers:
+            try:
+                cur.execute(
+                    "UPDATE performance_schema.setup_consumers "
+                    "SET ENABLED='YES' WHERE NAME=%s", (name,)
+                )
+                conn.commit()
+            except Error as e:
+                log.warning(f"  Could not enable consumer '{name}': {e}")
+        log.info("  ✓ Statement digest consumers enabled")
+
+        try:
+            cur.execute(
+                "UPDATE performance_schema.setup_instruments "
+                "SET ENABLED='YES', TIMED='YES' WHERE NAME LIKE 'statement/%%'"
+            )
+            conn.commit()
+            log.info("  ✓ Statement instruments enabled with timing")
+        except Error as e:
+            log.warning(f"  Could not enable statement instruments: {e}")
+
+    # ── 3. Slow query log with execution plans (MariaDB-specific) ───────
+    try:
+        cur.execute("SET GLOBAL slow_query_log = 1")
+        conn.commit()
+        cur.execute("SET GLOBAL long_query_time = 0.3")
+        conn.commit()
+        log.info("  ✓ Slow query log ON (threshold: 0.3s)")
+    except Error as e:
+        log.warning(f"  Could not enable slow query log: {e}")
+
+    # MariaDB-specific: log_slow_verbosity includes EXPLAIN output in slow log
+    try:
+        cur.execute("SET GLOBAL log_slow_verbosity = 'query_plan,explain'")
+        conn.commit()
+        log.info("  ✓ log_slow_verbosity = 'query_plan,explain' (execution plans in slow log)")
+    except Error as e:
+        log.warning(f"  Could not set log_slow_verbosity: {e}")
+
+    # ── 4. Log output to TABLE + FILE for Dynatrace access ────────────
+    try:
+        cur.execute("SET GLOBAL log_output = 'TABLE,FILE'")
+        conn.commit()
+        log.info("  ✓ log_output = TABLE,FILE")
+    except Error as e:
+        log.warning(f"  Could not set log_output: {e}")
+
+    # ── 5. Enable userstat for per-user / per-table metrics ─────────────
+    try:
+        cur.execute("SET GLOBAL userstat = 1")
+        conn.commit()
+        log.info("  ✓ userstat enabled")
+    except Error as e:
+        log.debug(f"  userstat not available: {e}")
+
+    # ── 6. Reset digest table for clean capture ─────────────────────────
+    if ps_on:
+        try:
+            cur.execute(
+                "TRUNCATE performance_schema.events_statements_summary_by_digest"
+            )
+            conn.commit()
+            log.info("  ✓ Statement digest table reset for fresh capture")
+        except Error as e:
+            log.debug(f"  Could not reset digest table: {e}")
+
+    # ── 7. Verify statement capture works ───────────────────────────────
+    if ps_on:
+        try:
+            cur.execute("USE `%s`" % cfg.database.replace('`', '``'))
+            cur.execute("SELECT 1 AS dynatrace_test")
+            cur.fetchall()
+            cur.execute(
+                "SELECT COUNT(*) AS cnt "
+                "FROM performance_schema.events_statements_summary_by_digest "
+                "WHERE SCHEMA_NAME = %s", (cfg.database,)
+            )
+            check = cur.fetchone()
+            if check and check.get('cnt', 0) > 0:
+                log.info("  ✓ Statement capture verified — digests being collected")
+            else:
+                log.warning("  ⚠ No digests found yet (will populate when scenarios run)")
+        except Error as e:
+            log.warning(f"  Could not verify capture: {e}")
+
+    cur.close()
+    conn.close()
+
+    # ── Print Dynatrace monitoring user SQL ─────────────────────────────
+    log.info("")
+    log.info("  Dynatrace monitoring user — run these grants if not done:")
+    log.info("    CREATE USER IF NOT EXISTS 'dynatrace'@'%%' IDENTIFIED BY '<password>';")
+    log.info("    GRANT SELECT ON performance_schema.* TO 'dynatrace'@'%%';")
+    log.info("    GRANT PROCESS, REPLICATION CLIENT ON *.* TO 'dynatrace'@'%%';")
+    log.info(f"    GRANT SELECT ON `{cfg.database}`.* TO 'dynatrace'@'%%';  -- for EXPLAIN")
+    log.info("    FLUSH PRIVILEGES;")
+
+    if issues:
+        log.warning("─" * 60)
+        log.warning("  ⚠ Issues that BLOCK Dynatrace visibility:")
+        for issue in issues:
+            log.warning(f"    • {issue}")
+        log.warning("─" * 60)
+    else:
+        log.info("  ✓ MariaDB is ready for Dynatrace Database Observability")
+    log.info("=" * 60)
+
 
 # =============================================================================
 # SCHEMA SETUP
@@ -816,6 +976,8 @@ def main():
         help="Run cleanup before scenarios")
     parser.add_argument("--cleanup-after", action="store_true",
         help="Run cleanup after scenarios")
+    parser.add_argument("--skip-monitoring-setup", action="store_true",
+        help="Skip Dynatrace monitoring configuration (performance_schema, slow log)")
     args = parser.parse_args()
 
     # Ensure DB exists
@@ -831,6 +993,10 @@ def main():
     except Error as e:
         log.error(f"Cannot connect to MariaDB: {e}")
         exit(1)
+
+    # Configure MariaDB for Dynatrace observability (performance_schema, slow log, explain plans)
+    if not args.skip_monitoring_setup:
+        setup_dynatrace_monitoring(args)
 
     setup_schema(args)
 
