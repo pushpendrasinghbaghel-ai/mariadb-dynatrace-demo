@@ -12,6 +12,13 @@ Simulates real-world database scenarios that surface in Dynatrace:
   - Temp table usage and filesorts
   - Connection pool exhaustion patterns
   - Mix of OLTP + reporting (heavy aggregations)
+  - Deadlock generation with retry detection
+  - Non-sargable queries (function on indexed column)
+  - Implicit type conversion defeating indexes
+  - Cartesian joins / missing JOIN conditions
+  - Unbounded SELECTs (missing LIMIT)
+  - Metadata lock / DDL blocking DML
+  - Query pattern drift (bad deployment simulation)
 
 Usage:
     pip install mysql-connector-python faker
@@ -61,7 +68,7 @@ def get_connection(cfg):
         user=cfg.user,
         password=cfg.password,
         database=cfg.database,
-        connection_timeout=10,
+        connection_timeout=30,
         autocommit=False,
         use_pure=True,   # Text protocol — ensures statement text in performance_schema
     )
@@ -131,7 +138,7 @@ def setup_dynatrace_monitoring(cfg):
     conn = mysql.connector.connect(
         host=cfg.host, port=cfg.port,
         user=cfg.user, password=cfg.password,
-        connection_timeout=10, use_pure=True,
+        connection_timeout=30, use_pure=True,
     )
     cur = conn.cursor(dictionary=True)
     issues = []
@@ -399,35 +406,52 @@ def seed_orders(conn, n=5000):
         log.warning("No customers/products found, skipping orders.")
         return
 
+    BATCH_SIZE = 100
+    order_batch = []
     for i in range(n):
         cid = random.choice(cust_ids)
         status = random.choice(statuses)
         created = fake.date_time_between(start_date="-1y", end_date="now")
-        cur2 = conn.cursor()
-        try:
-            cur2.execute(
-                "INSERT INTO orders (customer_id,status,total_amount,created_at) VALUES (%s,%s,%s,%s)",
-                (cid, status, 0, created)
-            )
-            oid = cur2.lastrowid
-            items = random.sample(prod_rows, min(random.randint(1, 5), len(prod_rows)))
-            total = 0
-            for pid, price in items:
-                qty = random.randint(1, 10)
-                total += float(price) * qty
-                cur2.execute(
-                    "INSERT INTO order_items (order_id,product_id,quantity,unit_price) VALUES (%s,%s,%s,%s)",
-                    (oid, pid, qty, price)
+        order_batch.append((cid, status, created))
+
+        if len(order_batch) >= BATCH_SIZE or i == n - 1:
+            cur2 = conn.cursor()
+            try:
+                # Insert orders in batch
+                cur2.executemany(
+                    "INSERT INTO orders (customer_id,status,total_amount,created_at) VALUES (%s,%s,0,%s)",
+                    order_batch
                 )
-            cur2.execute("UPDATE orders SET total_amount=%s WHERE id=%s", (total, oid))
-            conn.commit()
-        except Error as e:
-            conn.rollback()
-            log.debug(f"Order seed error: {e}")
-        finally:
-            cur2.close()
-        if i % 500 == 0:
-            log.info(f"  {i}/{n} orders...")
+                first_id = cur2.lastrowid
+                # Generate items for each order in this batch
+                item_rows = []
+                update_rows = []
+                for j, (cid_b, st_b, cr_b) in enumerate(order_batch):
+                    oid = first_id + j
+                    items = random.sample(prod_rows, min(random.randint(1, 5), len(prod_rows)))
+                    total = 0
+                    for pid, price in items:
+                        qty = random.randint(1, 10)
+                        total += float(price) * qty
+                        item_rows.append((oid, pid, qty, price))
+                    update_rows.append((total, oid))
+                # Batch insert items
+                cur2.executemany(
+                    "INSERT INTO order_items (order_id,product_id,quantity,unit_price) VALUES (%s,%s,%s,%s)",
+                    item_rows
+                )
+                # Batch update totals
+                for total, oid in update_rows:
+                    cur2.execute("UPDATE orders SET total_amount=%s WHERE id=%s", (total, oid))
+                conn.commit()
+            except Error as e:
+                conn.rollback()
+                log.debug(f"Order batch error: {e}")
+            finally:
+                cur2.close()
+            order_batch = []
+            if (i + 1) % 500 == 0 or i == n - 1:
+                log.info(f"  {i + 1}/{n} orders...")
     log.info("Orders seeded.")
 
 def seed_sales_facts(conn):
@@ -913,6 +937,345 @@ def scenario_long_transaction(cfg, hold_sec=8):
     log.info("✔ Scenario 10 done.")
 
 # =============================================================================
+# SCENARIO 11 — Deadlock (actual InnoDB deadlock with retry)
+# Dynatrace: Innodb_deadlocks counter, error events, rollback count
+# =============================================================================
+
+def _deadlock_thread(cfg, id_a, id_b, worker_id, barrier, results):
+    """Worker that updates two rows in a specific order to cause a deadlock."""
+    conn = get_connection(cfg)
+    try:
+        conn.start_transaction()
+        cur = conn.cursor()
+        # Lock first row
+        cur.execute("UPDATE orders SET total_amount = total_amount + 0.01 WHERE id = %s", (id_a,))
+        barrier.wait(timeout=10)  # synchronize so both workers hold one lock
+        time.sleep(0.1)
+        # Try to lock second row — should cause deadlock for one thread
+        cur.execute("UPDATE orders SET total_amount = total_amount + 0.01 WHERE id = %s", (id_b,))
+        conn.commit()
+        cur.close()
+        results[worker_id] = "committed"
+    except Error as e:
+        conn.rollback()
+        results[worker_id] = f"deadlock: {e}"
+        log.info(f"  Worker {worker_id} hit deadlock (expected): {str(e)[:80]}")
+    finally:
+        conn.close()
+
+def scenario_deadlock(cfg, iterations=5):
+    log.info("▶ SCENARIO 11: Deadlock generation (InnoDB deadlock detection)")
+    conn = get_connection(cfg)
+    rows = execute(conn, "SELECT id FROM orders LIMIT 10", fetch=True)
+    conn.close()
+    if len(rows) < 2:
+        log.warning("Not enough orders for deadlock scenario, skipping.")
+        return
+
+    deadlock_count = 0
+    for i in range(iterations):
+        id1, id2 = rows[i % len(rows)]['id'], rows[(i + 1) % len(rows)]['id']
+        barrier = threading.Barrier(2)
+        results = {}
+        # Thread 1: lock id1 then id2 | Thread 2: lock id2 then id1
+        t1 = threading.Thread(target=_deadlock_thread, args=(cfg, id1, id2, 1, barrier, results))
+        t2 = threading.Thread(target=_deadlock_thread, args=(cfg, id2, id1, 2, barrier, results))
+        t1.start(); t2.start()
+        t1.join(timeout=15); t2.join(timeout=15)
+        for wid, result in results.items():
+            if "deadlock" in result.lower():
+                deadlock_count += 1
+        time.sleep(0.5)
+
+    log.info(f"  Triggered {deadlock_count} deadlocks across {iterations} rounds")
+    log.info("✔ Scenario 11 done.")
+
+# =============================================================================
+# SCENARIO 12 — Connection Pool Exhaustion
+# Dynatrace: Threads_connected spike, connection refused errors, aborted_connects
+# =============================================================================
+
+def scenario_connection_exhaustion(cfg, target_connections=80):
+    log.info(f"▶ SCENARIO 12: Connection pool exhaustion ({target_connections} concurrent connections)")
+    connections = []
+    refused_count = 0
+    try:
+        for i in range(target_connections):
+            try:
+                c = mysql.connector.connect(
+                    host=cfg.host, port=cfg.port,
+                    user=cfg.user, password=cfg.password,
+                    database=cfg.database,
+                    connection_timeout=5, use_pure=True,
+                )
+                cur = c.cursor()
+                cur.execute("SELECT SLEEP(0.1)")  # keep connection alive
+                cur.fetchall()
+                cur.close()
+                connections.append(c)
+            except Error as e:
+                refused_count += 1
+                if i % 10 == 0:
+                    log.info(f"  Connection {i} refused: {str(e)[:80]}")
+        log.info(f"  Opened {len(connections)} connections, {refused_count} refused")
+        # Hold all connections open briefly to register in Dynatrace
+        time.sleep(5)
+    finally:
+        for c in connections:
+            try: c.close()
+            except: pass
+    log.info("✔ Scenario 12 done.")
+
+# =============================================================================
+# SCENARIO 13 — Non-sargable Queries (function on indexed column)
+# Dynatrace: EXPLAIN type=ALL despite index existing, high logical reads
+# =============================================================================
+
+def scenario_non_sargable(cfg, iterations=30):
+    log.info("▶ SCENARIO 13: Non-sargable queries (function wrapping indexed column)")
+    conn = get_connection(cfg)
+
+    # Ensure there's an index on created_at for orders
+    try:
+        execute(conn, "ALTER TABLE orders ADD INDEX idx_created_at (created_at)")
+    except: pass
+
+    # GOOD query — uses index
+    good_sql = "SELECT id, customer_id, total_amount FROM orders WHERE created_at >= '2025-01-01' AND created_at < '2025-07-01'"
+    # BAD query — wraps column in function, defeats index (non-sargable)
+    bad_sql_year = "SELECT id, customer_id, total_amount FROM orders WHERE YEAR(created_at) = 2025"
+    bad_sql_date = "SELECT id, customer_id, total_amount FROM orders WHERE DATE(created_at) = '2025-06-15'"
+    bad_sql_calc = "SELECT id, customer_id, total_amount FROM orders WHERE created_at + INTERVAL 1 DAY > NOW()"
+
+    log.info("  Running EXPLAIN on sargable vs non-sargable...")
+    log.info("  === GOOD (uses index) ===")
+    explain_query(conn, good_sql)
+    log.info("  === BAD: YEAR() on column ===")
+    explain_query(conn, bad_sql_year)
+    log.info("  === BAD: DATE() on column ===")
+    explain_query(conn, bad_sql_date)
+    log.info("  === BAD: arithmetic on column ===")
+    explain_query(conn, bad_sql_calc)
+
+    for _ in range(iterations):
+        execute(conn, good_sql, fetch=True)
+        execute(conn, bad_sql_year, fetch=True)
+        execute(conn, bad_sql_date, fetch=True)
+        execute(conn, bad_sql_calc, fetch=True)
+        time.sleep(random.uniform(0.05, 0.15))
+
+    conn.close()
+    log.info("✔ Scenario 13 done.")
+
+# =============================================================================
+# SCENARIO 14 — Implicit Type Conversion (string vs int mismatch)
+# Dynatrace: Index bypass, full scan on JOIN or WHERE, high reads
+# =============================================================================
+
+def scenario_implicit_conversion(cfg, iterations=30):
+    log.info("▶ SCENARIO 14: Implicit type conversion (string vs int)")
+    conn = get_connection(cfg)
+
+    # customer_id is INT but we query with string — forces implicit conversion, kills index
+    bad_where = "SELECT * FROM orders WHERE customer_id = '42'"          # string literal for int column
+    good_where = "SELECT * FROM orders WHERE customer_id = 42"           # correct int
+    bad_join = ("SELECT o.*, c.email FROM orders o "
+                "JOIN customers c ON c.id = CAST(o.customer_id AS CHAR) "  # force conversion
+                "LIMIT 50")
+
+    log.info("  Running EXPLAIN — implicit conversion scenarios...")
+    log.info("  === GOOD (int = int) ===")
+    explain_query(conn, good_where)
+    log.info("  === BAD (int = 'string') ===")
+    explain_query(conn, bad_where)
+    log.info("  === BAD (CAST in JOIN) ===")
+    explain_query(conn, bad_join)
+
+    for _ in range(iterations):
+        execute(conn, good_where, fetch=True)
+        execute(conn, bad_where, fetch=True)
+        execute(conn, bad_join, fetch=True)
+        time.sleep(random.uniform(0.05, 0.15))
+
+    conn.close()
+    log.info("✔ Scenario 14 done.")
+
+# =============================================================================
+# SCENARIO 15 — Cartesian Join (missing JOIN condition)
+# Dynatrace: Explosive row count, massive logical reads, long duration
+# =============================================================================
+
+def scenario_cartesian_join(cfg, iterations=5):
+    log.info("▶ SCENARIO 15: Cartesian join (missing/wrong JOIN condition)")
+    conn = get_connection(cfg)
+
+    # Intentional cartesian product — LIMIT keeps it from destroying the server
+    cartesian_sql = """
+        SELECT c.first_name, p.name, o.total_amount
+        FROM customers c, products p, orders o
+        WHERE c.tier = 'platinum'
+        LIMIT 5000
+    """
+    # Partial cartesian (missing one condition)
+    partial_sql = """
+        SELECT c.email, o.total_amount, oi.quantity
+        FROM customers c
+        JOIN orders o ON o.customer_id = c.id
+        JOIN order_items oi  -- missing: ON oi.order_id = o.id
+        WHERE c.country = 'US'
+        LIMIT 2000
+    """
+
+    log.info("  Running EXPLAIN — cartesian join...")
+    explain_query(conn, cartesian_sql)
+    log.info("  Running EXPLAIN — partial cartesian (missing JOIN ON)...")
+    explain_query(conn, partial_sql)
+
+    for _ in range(iterations):
+        execute(conn, cartesian_sql, fetch=True)
+        execute(conn, partial_sql, fetch=True)
+        time.sleep(random.uniform(0.3, 0.8))
+
+    conn.close()
+    log.info("✔ Scenario 15 done.")
+
+# =============================================================================
+# SCENARIO 16 — Unbounded SELECT (missing LIMIT on large tables)
+# Dynatrace: High network bytes, memory pressure, long query duration
+# =============================================================================
+
+def scenario_unbounded_select(cfg, iterations=8):
+    log.info("▶ SCENARIO 16: Unbounded SELECT (no LIMIT, full table transfer)")
+    conn = get_connection(cfg)
+
+    # These queries return ALL rows — heavy on network and memory
+    unbounded_sql = [
+        "SELECT * FROM orders",
+        "SELECT * FROM order_items",
+        "SELECT o.*, c.email, c.first_name, c.last_name FROM orders o JOIN customers c ON c.id = o.customer_id",
+        "SELECT * FROM events",
+    ]
+
+    for sql in unbounded_sql:
+        log.info(f"  EXPLAIN: {sql[:60]}...")
+        explain_query(conn, sql)
+
+    for _ in range(iterations):
+        sql = random.choice(unbounded_sql)
+        rows = execute(conn, sql, fetch=True)
+        log.debug(f"  Returned {len(rows)} rows")
+        time.sleep(random.uniform(0.3, 0.8))
+
+    conn.close()
+    log.info("✔ Scenario 16 done.")
+
+# =============================================================================
+# SCENARIO 17 — Metadata Lock / DDL Blocking
+# Dynatrace: DDL stalls visible, DML blocked, sudden latency spike
+# =============================================================================
+
+def _ddl_blocker_dml(cfg, duration_sec):
+    """Run DML in a loop while DDL is happening — will get blocked by metadata lock."""
+    conn = get_connection(cfg)
+    end = time.time() + duration_sec
+    blocked = 0
+    while time.time() < end:
+        try:
+            t0 = time.time()
+            execute(conn, "INSERT INTO events (event_type, entity_type, entity_id, payload) VALUES (%s,%s,%s,%s)",
+                    ('ddl_test', 'system', random.randint(1, 100), '{"test":"metadata_lock"}'))
+            dur = time.time() - t0
+            if dur > 1.0:
+                blocked += 1
+        except Error:
+            try: conn.rollback()
+            except: pass
+        time.sleep(0.05)
+    conn.close()
+    return blocked
+
+def scenario_metadata_lock(cfg):
+    log.info("▶ SCENARIO 17: Metadata lock / DDL blocking")
+    # Start DML workers
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        dml_futs = [ex.submit(_ddl_blocker_dml, cfg, 15) for _ in range(3)]
+        time.sleep(2)  # let DML workers start
+
+        # Now run DDL that will acquire metadata lock, blocking DML
+        conn = get_connection(cfg)
+        log.info("  Running ALTER TABLE on events (will block DML)...")
+        try:
+            execute(conn, "ALTER TABLE events ADD COLUMN _ddl_test INT NULL")
+            execute(conn, "ALTER TABLE events DROP COLUMN _ddl_test")
+        except Error as e:
+            log.warning(f"  DDL error: {e}")
+        conn.close()
+
+        blocked_total = 0
+        for f in as_completed(dml_futs):
+            blocked_total += f.result()
+    log.info(f"  {blocked_total} DML operations experienced metadata lock wait")
+    log.info("✔ Scenario 17 done.")
+
+# =============================================================================
+# SCENARIO 18 — Query Pattern Drift (simulates bad deployment)
+# Dynatrace: New digest appears, response time shifts, plan regression
+# =============================================================================
+
+def scenario_query_drift(cfg, iterations_before=20, iterations_after=30):
+    log.info("▶ SCENARIO 18: Query pattern drift (simulates bad deployment)")
+    conn = get_connection(cfg)
+
+    # Phase 1: "Old code" — efficient query using primary key
+    old_query = "SELECT id, email, tier FROM customers WHERE id = %s"
+    log.info("  Phase 1: 'Old code' — efficient PK lookup...")
+    explain_query(conn, old_query, (1,))
+    for _ in range(iterations_before):
+        cid = random.randint(1, 2000)
+        execute(conn, old_query, (cid,), fetch=True)
+        time.sleep(0.05)
+
+    log.info("  === Simulating bad deployment ===")
+    time.sleep(2)
+
+    # Phase 2: "New code" — developer rewrote query badly
+    # Uses SELECT * (more columns), subquery, no index usage
+    bad_query_1 = """
+        SELECT * FROM customers
+        WHERE email IN (
+            SELECT DISTINCT c2.email FROM customers c2
+            WHERE c2.tier = 'gold' OR c2.tier = 'platinum'
+        )
+    """
+    bad_query_2 = """
+        SELECT c.*, COUNT(o.id) as order_count, SUM(o.total_amount) as lifetime_value
+        FROM customers c
+        LEFT JOIN orders o ON o.customer_id = c.id
+        GROUP BY c.id
+        HAVING lifetime_value > 100
+        ORDER BY lifetime_value DESC
+    """
+    bad_query_3 = """
+        SELECT * FROM customers
+        WHERE CONCAT(first_name, ' ', last_name) LIKE %s
+    """
+
+    log.info("  Phase 2: 'New code' — inefficient queries after deployment...")
+    explain_query(conn, bad_query_1)
+    explain_query(conn, bad_query_2)
+    explain_query(conn, bad_query_3, ('%John%',))
+
+    for _ in range(iterations_after):
+        execute(conn, bad_query_1, fetch=True)
+        execute(conn, bad_query_2, fetch=True)
+        name = random.choice(['John', 'Jane', 'Smith', 'Williams', 'Brown'])
+        execute(conn, bad_query_3, (f'%{name}%',), fetch=True)
+        time.sleep(random.uniform(0.1, 0.3))
+
+    conn.close()
+    log.info("✔ Scenario 18 done.")
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -927,6 +1290,14 @@ ALL_SCENARIOS = {
     "mixed_oltp":          scenario_mixed_oltp,
     "temp_table_filesort": scenario_temp_table_filesort,
     "long_transaction":    scenario_long_transaction,
+    "deadlock":            scenario_deadlock,
+    "connection_exhaustion": scenario_connection_exhaustion,
+    "non_sargable":        scenario_non_sargable,
+    "implicit_conversion": scenario_implicit_conversion,
+    "cartesian_join":      scenario_cartesian_join,
+    "unbounded_select":    scenario_unbounded_select,
+    "metadata_lock":       scenario_metadata_lock,
+    "query_drift":         scenario_query_drift,
 }
 
 def run_all_scenarios(cfg):
@@ -936,11 +1307,12 @@ def run_all_scenarios(cfg):
     # Run baseline OLTP in background throughout
     oltp_thread = threading.Thread(
         target=scenario_mixed_oltp, args=(cfg,),
-        kwargs={"threads": 5, "duration_sec": 180}, daemon=True
+        kwargs={"threads": 5, "duration_sec": 300}, daemon=True
     )
     oltp_thread.start()
     time.sleep(3)
 
+    # --- Original scenarios (1-10) ---
     scenario_full_table_scan(cfg)
     scenario_n_plus_1(cfg)
     scenario_temp_table_filesort(cfg)
@@ -950,6 +1322,16 @@ def run_all_scenarios(cfg):
     scenario_long_transaction(cfg)
     scenario_heavy_aggregation(cfg)
     scenario_index_change(cfg)
+
+    # --- New scenarios (11-18) ---
+    scenario_deadlock(cfg)
+    scenario_connection_exhaustion(cfg)
+    scenario_non_sargable(cfg)
+    scenario_implicit_conversion(cfg)
+    scenario_cartesian_join(cfg)
+    scenario_unbounded_select(cfg)
+    scenario_metadata_lock(cfg)
+    scenario_query_drift(cfg)
 
     oltp_thread.join()
     log.info("=" * 60)
