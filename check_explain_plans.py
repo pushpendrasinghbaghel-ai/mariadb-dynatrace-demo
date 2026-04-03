@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Check MariaDB for explain plans and Dynatrace DB observability readiness."""
 
+import os
 import mysql.connector
 
-HOST = "REDACTED_HOST"
-PORT = 3306
-USER = "root"
-PASSWORD = "REDACTED_PASSWORD"
-DATABASE = "dynatrace_demo"
+HOST = os.environ["MARIADB_HOST"]
+PORT = int(os.environ.get("MARIADB_PORT", 3306))
+USER = os.environ.get("MARIADB_USER", "root")
+PASSWORD = os.environ["MARIADB_PASSWORD"]
+DATABASE = os.environ.get("MARIADB_DATABASE", "dynatrace_demo")
 
 conn = mysql.connector.connect(
     host=HOST, port=PORT, user=USER, password=PASSWORD,

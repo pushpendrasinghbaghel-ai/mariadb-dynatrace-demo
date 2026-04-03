@@ -18,6 +18,10 @@ ENV/
 # Logs
 *.log
 
+# Environment / secrets
+.env
+.env.*
+
 # Environment
 .env
 *.env

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Check failed explain queue entries."""
+import os
 import mysql.connector
 
 conn = mysql.connector.connect(
-    host="REDACTED_HOST",
-    port=3306, user="root", password="REDACTED_PASSWORD",
+    host=os.environ["MARIADB_HOST"],
+    port=int(os.environ.get("MARIADB_PORT", 3306)),
+    user=os.environ.get("MARIADB_USER", "root"),
+    password=os.environ["MARIADB_PASSWORD"],
     connection_timeout=30, use_pure=True,
 )
 cur = conn.cursor(dictionary=True)
