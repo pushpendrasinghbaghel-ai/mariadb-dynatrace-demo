@@ -20,6 +20,7 @@ Simulates real-world database scenarios that surface in Dynatrace:
   - Metadata lock / DDL blocking DML
   - Query pattern drift (bad deployment simulation)
   - Complex explain plans (subqueries, 5+ joins, derived tables, UNIONs, HAVING)
+  - Heavy lock contention (SHARE locks, gap locks, lock wait timeouts, rapid cycling)
 
 Usage:
     pip install mysql-connector-python faker
@@ -670,7 +671,7 @@ def scenario_heavy_aggregation(cfg, iterations=10):
 # Dynatrace: lock wait time metrics, transaction wait events
 # =============================================================================
 
-def _lock_worker(cfg, order_ids, worker_id):
+def _lock_worker(cfg, order_ids, worker_id, hold_min=1.0, hold_max=3.0):
     conn = get_connection(cfg)
     try:
         for oid in order_ids:
@@ -680,7 +681,7 @@ def _lock_worker(cfg, order_ids, worker_id):
                 cur.execute("SELECT id, total_amount, status FROM orders WHERE id = %s FOR UPDATE", (oid,))
                 row = cur.fetchone()
                 if row:
-                    time.sleep(random.uniform(0.05, 0.2))  # hold lock
+                    time.sleep(random.uniform(hold_min, hold_max))  # hold lock long enough to cause waits
                     cur.execute(
                         "UPDATE orders SET status='processing', total_amount=%s WHERE id=%s",
                         (float(row[1]) * 1.01, oid)
@@ -694,20 +695,27 @@ def _lock_worker(cfg, order_ids, worker_id):
         conn.close()
 
 def scenario_lock_contention(cfg, iterations=5):
-    log.info("▶ SCENARIO 4: Lock contention (concurrent UPDATE on overlapping rows)")
+    log.info("▶ SCENARIO 4: Lock contention (6 workers, 1-3s hold, overlapping rows)")
     conn = get_connection(cfg)
-    rows = execute(conn, "SELECT id FROM orders LIMIT 30", fetch=True)
+    rows = execute(conn, "SELECT id FROM orders LIMIT 50", fetch=True)
     conn.close()
     if not rows:
         log.warning("No orders found, skipping.")
         return
     ids = [r['id'] for r in rows]
-    for _ in range(iterations):
-        t1 = threading.Thread(target=_lock_worker, args=(cfg, ids[:15], 1))
-        t2 = threading.Thread(target=_lock_worker, args=(cfg, ids[10:25], 2))
-        t3 = threading.Thread(target=_lock_worker, args=(cfg, ids[5:20], 3))
-        for t in [t1, t2, t3]: t.start()
-        for t in [t1, t2, t3]: t.join()
+    for rnd in range(iterations):
+        # 6 workers with heavily overlapping row ranges — guarantees lock waits
+        workers = [
+            threading.Thread(target=_lock_worker, args=(cfg, ids[:20], 1)),
+            threading.Thread(target=_lock_worker, args=(cfg, ids[5:25], 2)),
+            threading.Thread(target=_lock_worker, args=(cfg, ids[10:30], 3)),
+            threading.Thread(target=_lock_worker, args=(cfg, ids[15:35], 4)),
+            threading.Thread(target=_lock_worker, args=(cfg, ids[20:40], 5)),
+            threading.Thread(target=_lock_worker, args=(cfg, ids[25:45], 6)),
+        ]
+        for w in workers: w.start()
+        for w in workers: w.join(timeout=60)
+        log.info(f"  Round {rnd + 1}/{iterations} complete")
         time.sleep(0.5)
     log.info("✔ Scenario 4 done.")
 
@@ -1519,6 +1527,187 @@ def scenario_complex_plans(cfg, iterations=10):
     log.info("✔ Scenario 19 done.")
 
 # =============================================================================
+# SCENARIO 20 — Heavy Lock Contention
+# Dynatrace: Innodb_row_lock_waits, Innodb_row_lock_time, lock_wait_timeout
+#            errors, SHARE MODE blocking, gap lock contention
+# =============================================================================
+
+def _heavy_lock_holder(cfg, order_ids, hold_sec, mode="exclusive"):
+    """Hold row locks for an extended time to force other sessions to wait."""
+    conn = get_connection(cfg)
+    try:
+        conn.start_transaction()
+        cur = conn.cursor()
+        placeholders = ','.join(['%s'] * len(order_ids))
+        if mode == "share":
+            cur.execute(f"SELECT * FROM orders WHERE id IN ({placeholders}) LOCK IN SHARE MODE", order_ids)
+        else:
+            cur.execute(f"SELECT * FROM orders WHERE id IN ({placeholders}) FOR UPDATE", order_ids)
+        cur.fetchall()
+        log.info(f"  Lock holder ({mode}): locked {len(order_ids)} rows, holding {hold_sec}s...")
+        time.sleep(hold_sec)
+        conn.commit()
+        cur.close()
+    except Error as e:
+        try: conn.rollback()
+        except: pass
+        log.debug(f"Lock holder ({mode}) error: {e}")
+    finally:
+        conn.close()
+
+def _heavy_lock_waiter(cfg, order_ids, worker_id, results):
+    """Try to update locked rows — will be blocked and may hit lock_wait_timeout."""
+    conn = get_connection(cfg)
+    waits = 0
+    timeouts = 0
+    try:
+        for oid in order_ids:
+            try:
+                t0 = time.time()
+                conn.start_transaction()
+                cur = conn.cursor()
+                cur.execute("UPDATE orders SET total_amount = total_amount + 0.01 WHERE id = %s", (oid,))
+                conn.commit()
+                cur.close()
+                wait_ms = (time.time() - t0) * 1000
+                if wait_ms > 500:
+                    waits += 1
+                    log.info(f"  Waiter {worker_id}: waited {wait_ms:.0f}ms for row {oid}")
+            except Error as e:
+                try: conn.rollback()
+                except: pass
+                err = str(e).lower()
+                if "lock wait timeout" in err:
+                    timeouts += 1
+                    log.info(f"  Waiter {worker_id}: LOCK WAIT TIMEOUT on row {oid}")
+                else:
+                    log.debug(f"  Waiter {worker_id} error: {e}")
+    finally:
+        conn.close()
+    results[worker_id] = {"waits": waits, "timeouts": timeouts}
+
+def _gap_lock_worker(cfg, worker_id, range_start, range_end, results):
+    """Cause gap lock contention via range queries with FOR UPDATE."""
+    conn = get_connection(cfg)
+    gap_locks = 0
+    try:
+        for _ in range(3):
+            try:
+                conn.start_transaction()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT * FROM orders WHERE id BETWEEN %s AND %s FOR UPDATE",
+                    (range_start, range_end)
+                )
+                cur.fetchall()
+                time.sleep(random.uniform(1.0, 2.0))
+                # Insert into the gap — may conflict with other gap locks
+                try:
+                    cur.execute(
+                        "INSERT INTO events (event_type, entity_type, entity_id, payload) "
+                        "VALUES (%s, %s, %s, %s)",
+                        ('gap_lock_test', 'order', range_start, f'{{"worker": {worker_id}}}')
+                    )
+                except Error:
+                    pass
+                conn.commit()
+                cur.close()
+                gap_locks += 1
+            except Error as e:
+                try: conn.rollback()
+                except: pass
+                log.debug(f"Gap lock worker {worker_id}: {e}")
+            time.sleep(0.2)
+    finally:
+        conn.close()
+    results[worker_id] = gap_locks
+
+def scenario_heavy_lock_contention(cfg):
+    log.info("▶ SCENARIO 20: Heavy lock contention (SHARE locks, gap locks, timeouts)")
+    conn = get_connection(cfg)
+    rows = execute(conn, "SELECT id FROM orders ORDER BY id LIMIT 40", fetch=True)
+    conn.close()
+    if len(rows) < 20:
+        log.warning("Not enough orders for heavy lock scenario, skipping.")
+        return
+    ids = [r['id'] for r in rows]
+
+    # --- Phase 1: Exclusive lock holder blocks multiple writers ---
+    log.info("  Phase 1: Exclusive lock holder + 4 blocked writers")
+    results = {}
+    holder = threading.Thread(
+        target=_heavy_lock_holder, args=(cfg, ids[:20], 10, "exclusive")
+    )
+    holder.start()
+    time.sleep(0.5)  # let holder acquire locks
+    waiters = []
+    for i in range(4):
+        w = threading.Thread(
+            target=_heavy_lock_waiter,
+            args=(cfg, ids[:20], i + 1, results)
+        )
+        waiters.append(w)
+        w.start()
+    holder.join(timeout=20)
+    for w in waiters: w.join(timeout=20)
+    total_waits = sum(r.get("waits", 0) for r in results.values())
+    total_timeouts = sum(r.get("timeouts", 0) for r in results.values())
+    log.info(f"  Phase 1 result: {total_waits} lock waits, {total_timeouts} timeouts")
+
+    # --- Phase 2: SHARE lock blocks exclusive writers ---
+    log.info("  Phase 2: SHARE lock holder blocks UPDATE writers")
+    results = {}
+    holder = threading.Thread(
+        target=_heavy_lock_holder, args=(cfg, ids[10:30], 8, "share")
+    )
+    holder.start()
+    time.sleep(0.5)
+    waiters = []
+    for i in range(3):
+        w = threading.Thread(
+            target=_heavy_lock_waiter,
+            args=(cfg, ids[10:30], i + 10, results)
+        )
+        waiters.append(w)
+        w.start()
+    holder.join(timeout=15)
+    for w in waiters: w.join(timeout=15)
+    total_waits = sum(r.get("waits", 0) for r in results.values())
+    log.info(f"  Phase 2 result: {total_waits} lock waits (SHARE → exclusive conflict)")
+
+    # --- Phase 3: Gap lock contention via overlapping range scans ---
+    log.info("  Phase 3: Gap lock contention (overlapping range FOR UPDATE)")
+    gap_results = {}
+    gap_threads = []
+    for i in range(4):
+        start_idx = i * 5
+        end_idx = start_idx + 15  # overlapping ranges
+        t = threading.Thread(
+            target=_gap_lock_worker,
+            args=(cfg, i + 1, ids[start_idx], ids[min(end_idx, len(ids) - 1)], gap_results)
+        )
+        gap_threads.append(t)
+        t.start()
+    for t in gap_threads: t.join(timeout=30)
+    log.info(f"  Phase 3 result: gap lock rounds completed")
+
+    # --- Phase 4: Rapid lock acquire/release cycle (high Innodb_row_lock_waits) ---
+    log.info("  Phase 4: Rapid lock cycling (8 workers, same 10 rows)")
+    hot_ids = ids[:10]
+    rapid_workers = []
+    for i in range(8):
+        t = threading.Thread(
+            target=_lock_worker,
+            args=(cfg, hot_ids * 2, i + 1, 0.5, 1.5)  # hold 0.5-1.5s each
+        )
+        rapid_workers.append(t)
+        t.start()
+    for t in rapid_workers: t.join(timeout=60)
+    log.info("  Phase 4 complete")
+
+    log.info("✔ Scenario 20 done.")
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -1542,6 +1731,7 @@ ALL_SCENARIOS = {
     "metadata_lock":       scenario_metadata_lock,
     "query_drift":         scenario_query_drift,
     "complex_plans":       scenario_complex_plans,
+    "heavy_lock_contention": scenario_heavy_lock_contention,
 }
 
 def run_all_scenarios(cfg):
@@ -1577,6 +1767,7 @@ def run_all_scenarios(cfg):
     scenario_metadata_lock(cfg)
     scenario_query_drift(cfg)
     scenario_complex_plans(cfg)
+    scenario_heavy_lock_contention(cfg)
 
     oltp_thread.join()
     log.info("=" * 60)
