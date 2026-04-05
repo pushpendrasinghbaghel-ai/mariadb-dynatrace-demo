@@ -37,6 +37,16 @@ on:
           - mixed_oltp
           - temp_table_filesort
           - long_transaction
+          - deadlock
+          - connection_exhaustion
+          - non_sargable
+          - implicit_conversion
+          - cartesian_join
+          - unbounded_select
+          - metadata_lock
+          - query_drift
+          - complex_plans
+          - heavy_lock_contention
       skip_seed:
         description: 'Skip seeding data'
         required: false
@@ -60,7 +70,7 @@ jobs:
   run-demo:
     name: Run MariaDB Demo Scenarios
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
