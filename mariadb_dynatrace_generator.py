@@ -19,6 +19,7 @@ Simulates real-world database scenarios that surface in Dynatrace:
   - Unbounded SELECTs (missing LIMIT)
   - Metadata lock / DDL blocking DML
   - Query pattern drift (bad deployment simulation)
+  - Complex explain plans (subqueries, 5+ joins, derived tables, UNIONs, HAVING)
 
 Usage:
     pip install mysql-connector-python faker
@@ -1276,6 +1277,248 @@ def scenario_query_drift(cfg, iterations_before=20, iterations_after=30):
     log.info("✔ Scenario 18 done.")
 
 # =============================================================================
+# SCENARIO 19 — Complex Explain Plans (deep node trees for visualizer demos)
+# Dynatrace: Multi-node explain plans with subqueries, 5+ table joins,
+#            derived tables, UNIONs, and GROUP BY/HAVING
+# =============================================================================
+
+def scenario_complex_plans(cfg, iterations=10):
+    log.info("▶ SCENARIO 19: Complex explain plans (deep node trees)")
+    conn = get_connection(cfg)
+
+    # ── 1. Correlated subquery with nested scalar subquery (select_id 1,2,3) ──
+    subquery_sql = """
+        SELECT c.id, c.email, c.tier,
+               (SELECT COUNT(*)
+                FROM orders o
+                WHERE o.customer_id = c.id
+                  AND o.status IN ('shipped','delivered')) AS completed_orders,
+               (SELECT COALESCE(SUM(oi.quantity * oi.unit_price), 0)
+                FROM order_items oi
+                WHERE oi.order_id IN (
+                    SELECT o2.id FROM orders o2 WHERE o2.customer_id = c.id
+                )) AS lifetime_value
+        FROM customers c
+        WHERE c.tier IN ('gold','platinum')
+          AND EXISTS (
+              SELECT 1 FROM orders o3
+              WHERE o3.customer_id = c.id
+                AND o3.created_at >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+          )
+        ORDER BY lifetime_value DESC
+        LIMIT 50
+    """
+
+    # ── 2. Five-table JOIN with aggregation (5-node nested_loop) ──────────
+    five_join_sql = """
+        SELECT c.country, c.tier,
+               p.category,
+               COUNT(DISTINCT o.id) AS order_count,
+               SUM(oi.quantity) AS total_items,
+               SUM(oi.quantity * oi.unit_price) AS gross_revenue,
+               AVG(sf.revenue) AS avg_fact_revenue,
+               MAX(o.created_at) AS last_order_date
+        FROM customers c
+        JOIN orders o       ON o.customer_id = c.id
+        JOIN order_items oi ON oi.order_id = o.id
+        JOIN products p     ON p.id = oi.product_id
+        JOIN sales_facts sf ON sf.order_id = o.id AND sf.product_id = p.id
+        WHERE c.country IN ('US','GB','DE','IN','FR')
+          AND o.status != 'cancelled'
+          AND p.price > 10.00
+        GROUP BY c.country, c.tier, p.category
+        HAVING gross_revenue > 100
+        ORDER BY gross_revenue DESC
+        LIMIT 100
+    """
+
+    # ── 3. Derived table / subquery in FROM (materialized_from_subquery) ──
+    derived_sql = """
+        SELECT ranked.country, ranked.tier,
+               ranked.total_revenue, ranked.customer_count,
+               ranked.total_revenue / ranked.customer_count AS revenue_per_customer,
+               p_stats.top_category, p_stats.category_revenue
+        FROM (
+            SELECT c.country, c.tier,
+                   SUM(o.total_amount) AS total_revenue,
+                   COUNT(DISTINCT c.id) AS customer_count
+            FROM customers c
+            JOIN orders o ON o.customer_id = c.id
+            WHERE o.status IN ('shipped','delivered')
+            GROUP BY c.country, c.tier
+            HAVING total_revenue > 50
+        ) AS ranked
+        JOIN (
+            SELECT sf.country, sf.tier, sf.category AS top_category,
+                   SUM(sf.revenue) AS category_revenue,
+                   ROW_NUMBER() OVER (PARTITION BY sf.country, sf.tier ORDER BY SUM(sf.revenue) DESC) AS rn
+            FROM sales_facts sf
+            GROUP BY sf.country, sf.tier, sf.category
+        ) AS p_stats ON p_stats.country = ranked.country
+                     AND p_stats.tier = ranked.tier
+                     AND p_stats.rn = 1
+        ORDER BY ranked.total_revenue DESC
+        LIMIT 50
+    """
+
+    # ── 4. UNION of multiple query branches (union_result) ────────────────
+    union_sql = """
+        SELECT 'high_value_customer' AS segment, c.id, c.email,
+               SUM(o.total_amount) AS metric_value
+        FROM customers c
+        JOIN orders o ON o.customer_id = c.id
+        WHERE c.tier = 'platinum'
+        GROUP BY c.id, c.email
+        HAVING metric_value > 500
+
+        UNION ALL
+
+        SELECT 'frequent_buyer' AS segment, c.id, c.email,
+               COUNT(o.id) AS metric_value
+        FROM customers c
+        JOIN orders o ON o.customer_id = c.id
+        WHERE o.created_at >= DATE_SUB(NOW(), INTERVAL 3 MONTH)
+        GROUP BY c.id, c.email
+        HAVING metric_value > 5
+
+        UNION ALL
+
+        SELECT 'big_basket' AS segment, c.id, c.email,
+               MAX(item_counts.item_count) AS metric_value
+        FROM customers c
+        JOIN orders o ON o.customer_id = c.id
+        JOIN (
+            SELECT order_id, COUNT(*) AS item_count
+            FROM order_items
+            GROUP BY order_id
+        ) AS item_counts ON item_counts.order_id = o.id
+        GROUP BY c.id, c.email
+        HAVING metric_value > 3
+
+        ORDER BY metric_value DESC
+        LIMIT 100
+    """
+
+    # ── 5. Multi-level GROUP BY + HAVING with window function ─────────────
+    grouping_sql = """
+        SELECT category_stats.*,
+               CASE
+                   WHEN category_stats.avg_order_value > 200 THEN 'premium'
+                   WHEN category_stats.avg_order_value > 50  THEN 'standard'
+                   ELSE 'budget'
+               END AS price_segment
+        FROM (
+            SELECT p.category,
+                   c.country,
+                   COUNT(DISTINCT o.id) AS order_count,
+                   COUNT(DISTINCT c.id) AS unique_customers,
+                   SUM(oi.quantity * oi.unit_price) AS total_revenue,
+                   AVG(o.total_amount) AS avg_order_value,
+                   SUM(oi.quantity) AS total_units_sold,
+                   MAX(o.created_at) AS most_recent_order
+            FROM products p
+            JOIN order_items oi ON oi.product_id = p.id
+            JOIN orders o       ON o.id = oi.order_id
+            JOIN customers c    ON c.id = o.customer_id
+            WHERE o.created_at >= DATE_SUB(NOW(), INTERVAL 1 YEAR)
+              AND o.status != 'cancelled'
+            GROUP BY p.category, c.country
+            HAVING order_count >= 2
+               AND total_revenue > 10
+        ) AS category_stats
+        ORDER BY category_stats.total_revenue DESC
+        LIMIT 200
+    """
+
+    # ── 6. Complex subquery with EXISTS, IN, and JOIN (deeply nested) ─────
+    nested_sql = """
+        SELECT c.id, c.email, c.first_name, c.last_name, c.tier,
+               order_summary.order_count, order_summary.total_spent
+        FROM customers c
+        JOIN (
+            SELECT o.customer_id,
+                   COUNT(*) AS order_count,
+                   SUM(o.total_amount) AS total_spent
+            FROM orders o
+            WHERE o.status IN ('shipped','delivered')
+            GROUP BY o.customer_id
+        ) AS order_summary ON order_summary.customer_id = c.id
+        WHERE c.tier IN ('gold','platinum')
+          AND order_summary.total_spent > (
+              SELECT AVG(sub_total.customer_total) * 1.5
+              FROM (
+                  SELECT SUM(o2.total_amount) AS customer_total
+                  FROM orders o2
+                  WHERE o2.status IN ('shipped','delivered')
+                  GROUP BY o2.customer_id
+              ) AS sub_total
+          )
+          AND EXISTS (
+              SELECT 1
+              FROM order_items oi
+              JOIN products p ON p.id = oi.product_id
+              WHERE oi.order_id IN (SELECT id FROM orders WHERE customer_id = c.id)
+                AND p.category = 'Electronics'
+          )
+        ORDER BY order_summary.total_spent DESC
+        LIMIT 25
+    """
+
+    # ── 7. Anti-join pattern with LEFT JOIN / IS NULL + subquery ──────────
+    antijoin_sql = """
+        SELECT c.id, c.email, c.tier, c.created_at,
+               last_order.last_order_date,
+               DATEDIFF(NOW(), COALESCE(last_order.last_order_date, c.created_at)) AS days_inactive
+        FROM customers c
+        LEFT JOIN (
+            SELECT customer_id, MAX(created_at) AS last_order_date
+            FROM orders
+            GROUP BY customer_id
+        ) AS last_order ON last_order.customer_id = c.id
+        WHERE c.tier IN ('gold','platinum')
+          AND (last_order.last_order_date IS NULL
+               OR last_order.last_order_date < DATE_SUB(NOW(), INTERVAL 90 DAY))
+          AND c.id NOT IN (
+              SELECT DISTINCT s.customer_id
+              FROM sessions s
+              WHERE s.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+                AND s.customer_id IS NOT NULL
+          )
+        ORDER BY days_inactive DESC
+        LIMIT 50
+    """
+
+    all_complex_queries = [
+        ("Correlated subqueries (3 levels deep)", subquery_sql, None),
+        ("5-table JOIN + GROUP BY + HAVING", five_join_sql, None),
+        ("Derived tables in FROM", derived_sql, None),
+        ("UNION ALL (3 branches + derived table)", union_sql, None),
+        ("Multi-level GROUP BY + HAVING + CASE", grouping_sql, None),
+        ("Deeply nested subqueries (EXISTS + IN + derived)", nested_sql, None),
+        ("Anti-join (LEFT JOIN + IS NULL + NOT IN)", antijoin_sql, None),
+    ]
+
+    # Run EXPLAIN on all complex queries to populate Dynatrace explain plans
+    log.info("  Running EXPLAIN on 7 complex query patterns...")
+    for label, sql, params in all_complex_queries:
+        log.info(f"  --- {label} ---")
+        explain_query(conn, sql, params)
+
+    # Execute queries repeatedly to build up statistics in performance_schema
+    log.info(f"  Executing complex queries ({iterations} rounds)...")
+    for i in range(iterations):
+        for label, sql, params in all_complex_queries:
+            execute(conn, sql, params, fetch=True)
+        if i % 3 == 0:
+            # Re-run EXPLAIN periodically to keep plans fresh
+            for label, sql, params in all_complex_queries:
+                explain_query(conn, sql, params)
+        time.sleep(random.uniform(0.3, 0.8))
+
+    conn.close()
+    log.info("✔ Scenario 19 done.")
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -1298,6 +1541,7 @@ ALL_SCENARIOS = {
     "unbounded_select":    scenario_unbounded_select,
     "metadata_lock":       scenario_metadata_lock,
     "query_drift":         scenario_query_drift,
+    "complex_plans":       scenario_complex_plans,
 }
 
 def run_all_scenarios(cfg):
@@ -1332,6 +1576,7 @@ def run_all_scenarios(cfg):
     scenario_unbounded_select(cfg)
     scenario_metadata_lock(cfg)
     scenario_query_drift(cfg)
+    scenario_complex_plans(cfg)
 
     oltp_thread.join()
     log.info("=" * 60)
