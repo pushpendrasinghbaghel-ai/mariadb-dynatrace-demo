@@ -343,6 +343,160 @@ SCHEMA_STATEMENTS = [
         sale_month  TINYINT,
         sale_year   SMALLINT
     )""",
+    # ── New tables for complex explain plan scenarios ─────────────────────
+    """CREATE TABLE IF NOT EXISTS product_categories (
+        id          INT AUTO_INCREMENT PRIMARY KEY,
+        name        VARCHAR(100) NOT NULL,
+        parent_id   INT NULL,
+        depth       INT DEFAULT 0,
+        path        VARCHAR(500) DEFAULT '',
+        INDEX idx_parent (parent_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS departments (
+        id              INT AUTO_INCREMENT PRIMARY KEY,
+        name            VARCHAR(100) NOT NULL,
+        parent_dept_id  INT NULL,
+        budget          DECIMAL(15,2) DEFAULT 0,
+        cost_center     VARCHAR(20),
+        INDEX idx_parent_dept (parent_dept_id),
+        INDEX idx_cost_center (cost_center)
+    )""",
+    """CREATE TABLE IF NOT EXISTS employees (
+        id                INT AUTO_INCREMENT PRIMARY KEY,
+        first_name        VARCHAR(100),
+        last_name         VARCHAR(100),
+        email             VARCHAR(255) NOT NULL,
+        department_id     INT,
+        manager_id        INT NULL,
+        hire_date         DATE,
+        salary            DECIMAL(12,2),
+        performance_score DECIMAL(3,2),
+        is_active         TINYINT DEFAULT 1,
+        INDEX idx_dept (department_id),
+        INDEX idx_manager (manager_id),
+        INDEX idx_hire_date (hire_date),
+        INDEX idx_salary (salary),
+        INDEX idx_dept_salary (department_id, salary),
+        INDEX idx_active_dept (is_active, department_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS product_reviews (
+        id            INT AUTO_INCREMENT PRIMARY KEY,
+        product_id    INT NOT NULL,
+        customer_id   INT NOT NULL,
+        rating        TINYINT NOT NULL,
+        review_title  VARCHAR(200),
+        review_text   TEXT,
+        helpful_votes INT DEFAULT 0,
+        verified      TINYINT DEFAULT 0,
+        created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_product (product_id),
+        INDEX idx_customer (customer_id),
+        INDEX idx_rating (rating),
+        INDEX idx_product_rating (product_id, rating),
+        INDEX idx_verified_rating (verified, rating),
+        FULLTEXT INDEX ft_review (review_title, review_text)
+    )""",
+    """CREATE TABLE IF NOT EXISTS warehouses (
+        id        INT AUTO_INCREMENT PRIMARY KEY,
+        name      VARCHAR(100),
+        region    VARCHAR(50),
+        country   VARCHAR(50),
+        capacity  INT,
+        INDEX idx_region (region),
+        INDEX idx_country (country)
+    )""",
+    """CREATE TABLE IF NOT EXISTS warehouse_stock (
+        id               INT AUTO_INCREMENT PRIMARY KEY,
+        warehouse_id     INT NOT NULL,
+        product_id       INT NOT NULL,
+        quantity         INT DEFAULT 0,
+        reserved_qty     INT DEFAULT 0,
+        last_restock_date DATE,
+        INDEX idx_warehouse (warehouse_id),
+        INDEX idx_product (product_id),
+        INDEX idx_wh_prod (warehouse_id, product_id),
+        INDEX idx_quantity (quantity)
+    )""",
+    """CREATE TABLE IF NOT EXISTS suppliers (
+        id             INT AUTO_INCREMENT PRIMARY KEY,
+        name           VARCHAR(200),
+        country        VARCHAR(50),
+        rating         DECIMAL(3,2),
+        lead_time_days INT,
+        is_active      TINYINT DEFAULT 1,
+        INDEX idx_country (country),
+        INDEX idx_rating (rating),
+        INDEX idx_active (is_active)
+    )""",
+    """CREATE TABLE IF NOT EXISTS product_suppliers (
+        id          INT AUTO_INCREMENT PRIMARY KEY,
+        product_id  INT NOT NULL,
+        supplier_id INT NOT NULL,
+        unit_cost   DECIMAL(10,2),
+        is_primary  TINYINT DEFAULT 0,
+        INDEX idx_product (product_id),
+        INDEX idx_supplier (supplier_id),
+        INDEX idx_prod_supp (product_id, supplier_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS payment_transactions (
+        id              INT AUTO_INCREMENT PRIMARY KEY,
+        order_id        INT NOT NULL,
+        payment_method  ENUM('credit_card','debit_card','paypal','wire','crypto') DEFAULT 'credit_card',
+        amount          DECIMAL(12,2),
+        currency        VARCHAR(3) DEFAULT 'USD',
+        status          ENUM('pending','authorized','captured','refunded','failed') DEFAULT 'pending',
+        gateway_ref     VARCHAR(100),
+        fraud_score     DECIMAL(5,4) DEFAULT NULL,
+        created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+        processed_at    DATETIME,
+        INDEX idx_order (order_id),
+        INDEX idx_status (status),
+        INDEX idx_method (payment_method),
+        INDEX idx_created (created_at),
+        INDEX idx_gateway (gateway_ref),
+        INDEX idx_method_status (payment_method, status),
+        INDEX idx_order_status (order_id, status),
+        INDEX idx_fraud (fraud_score)
+    )""",
+    """CREATE TABLE IF NOT EXISTS promotions (
+        id               INT AUTO_INCREMENT PRIMARY KEY,
+        code             VARCHAR(50) UNIQUE,
+        description      VARCHAR(255),
+        discount_type    ENUM('percentage','fixed','buy_x_get_y') DEFAULT 'percentage',
+        discount_value   DECIMAL(10,2),
+        min_order_amount DECIMAL(10,2) DEFAULT 0,
+        max_uses         INT DEFAULT NULL,
+        current_uses     INT DEFAULT 0,
+        valid_from       DATE,
+        valid_until      DATE,
+        target_tier      ENUM('bronze','silver','gold','platinum') DEFAULT NULL,
+        target_category  VARCHAR(100) DEFAULT NULL,
+        INDEX idx_code (code),
+        INDEX idx_valid (valid_from, valid_until),
+        INDEX idx_tier (target_tier)
+    )""",
+    """CREATE TABLE IF NOT EXISTS order_promotions (
+        id              INT AUTO_INCREMENT PRIMARY KEY,
+        order_id        INT NOT NULL,
+        promotion_id    INT NOT NULL,
+        discount_amount DECIMAL(10,2),
+        INDEX idx_order (order_id),
+        INDEX idx_promo (promotion_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS inventory_log (
+        id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+        product_id      INT NOT NULL,
+        warehouse_id    INT NOT NULL,
+        change_type     ENUM('receipt','sale','adjustment','transfer','return') DEFAULT 'sale',
+        quantity_change INT,
+        reference_id    INT,
+        created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_product (product_id),
+        INDEX idx_warehouse (warehouse_id),
+        INDEX idx_type (change_type),
+        INDEX idx_created (created_at),
+        INDEX idx_prod_wh_created (product_id, warehouse_id, created_at)
+    )""",
 ]
 
 def setup_schema(cfg):
@@ -473,6 +627,368 @@ def seed_sales_facts(conn):
     """)
     log.info("sales_facts populated.")
 
+# ── Seed new complex tables ──────────────────────────────────────────────────
+
+def seed_product_categories(conn):
+    """Seed hierarchical product categories (3 levels deep) for recursive CTE demos."""
+    log.info("Seeding product_categories (3 levels)...")
+    top_level = [
+        'Electronics', 'Clothing', 'Home & Garden', 'Sports & Outdoors',
+        'Books & Media', 'Food & Beverage', 'Health & Beauty', 'Automotive',
+    ]
+    rows = []
+    cat_id = 1
+    id_map = {}  # name -> id
+    # Level 0
+    for name in top_level:
+        rows.append((cat_id, name, None, 0, name))
+        id_map[name] = cat_id
+        cat_id += 1
+    # Level 1
+    sub_cats = {
+        'Electronics': ['Smartphones', 'Laptops', 'Tablets', 'Cameras', 'Audio', 'Wearables'],
+        'Clothing': ['Men', 'Women', 'Kids', 'Accessories', 'Shoes', 'Sportswear'],
+        'Home & Garden': ['Furniture', 'Kitchen', 'Bedding', 'Lighting', 'Garden Tools', 'Decor'],
+        'Sports & Outdoors': ['Fitness', 'Camping', 'Cycling', 'Running', 'Team Sports', 'Water Sports'],
+        'Books & Media': ['Fiction', 'Non-Fiction', 'Textbooks', 'Comics', 'Music', 'Movies'],
+        'Food & Beverage': ['Snacks', 'Drinks', 'Organic', 'Frozen', 'Gourmet', 'Supplements'],
+        'Health & Beauty': ['Skincare', 'Haircare', 'Makeup', 'Vitamins', 'Personal Care', 'Fragrance'],
+        'Automotive': ['Parts', 'Tools', 'Electronics', 'Accessories', 'Tires', 'Oils'],
+    }
+    for parent, children in sub_cats.items():
+        for child in children:
+            path = f"{parent}/{child}"
+            rows.append((cat_id, child, id_map[parent], 1, path))
+            id_map[path] = cat_id
+            cat_id += 1
+    # Level 2
+    deep_cats = {
+        'Electronics/Smartphones': ['Budget Phones', 'Flagship Phones', 'Foldable Phones'],
+        'Electronics/Laptops': ['Gaming Laptops', 'Ultrabooks', 'Workstations'],
+        'Clothing/Men': ['Casual Shirts', 'Formal Wear', 'Outerwear'],
+        'Clothing/Women': ['Dresses', 'Activewear', 'Handbags'],
+        'Home & Garden/Kitchen': ['Cookware', 'Small Appliances', 'Utensils'],
+        'Sports & Outdoors/Fitness': ['Weights', 'Yoga', 'Cardio Machines'],
+    }
+    for parent_path, children in deep_cats.items():
+        if parent_path in id_map:
+            for child in children:
+                path = f"{parent_path}/{child}"
+                rows.append((cat_id, child, id_map[parent_path], 2, path))
+                id_map[path] = cat_id
+                cat_id += 1
+    execute(conn,
+        "INSERT INTO product_categories (id, name, parent_id, depth, path) VALUES (%s,%s,%s,%s,%s)",
+        rows, many=True)
+    log.info(f"  {len(rows)} categories seeded.")
+
+def seed_departments(conn):
+    """Seed department hierarchy for self-join + recursive CTE demos."""
+    log.info("Seeding departments...")
+    depts = [
+        (1, 'Company', None, 10000000, 'CC-000'),
+        (2, 'Engineering', 1, 5000000, 'CC-100'),
+        (3, 'Sales', 1, 3000000, 'CC-200'),
+        (4, 'Marketing', 1, 1500000, 'CC-300'),
+        (5, 'Finance', 1, 800000, 'CC-400'),
+        (6, 'HR', 1, 600000, 'CC-500'),
+        (7, 'Backend', 2, 2000000, 'CC-110'),
+        (8, 'Frontend', 2, 1500000, 'CC-120'),
+        (9, 'DevOps', 2, 1000000, 'CC-130'),
+        (10, 'Data', 2, 800000, 'CC-140'),
+        (11, 'Enterprise Sales', 3, 1500000, 'CC-210'),
+        (12, 'SMB Sales', 3, 800000, 'CC-220'),
+        (13, 'Sales Engineering', 3, 700000, 'CC-230'),
+        (14, 'Digital Marketing', 4, 800000, 'CC-310'),
+        (15, 'Content', 4, 400000, 'CC-320'),
+        (16, 'Accounting', 5, 400000, 'CC-410'),
+        (17, 'FP&A', 5, 300000, 'CC-420'),
+        (18, 'Recruiting', 6, 300000, 'CC-510'),
+        (19, 'People Ops', 6, 200000, 'CC-520'),
+        (20, 'QA', 2, 500000, 'CC-150'),
+    ]
+    execute(conn,
+        "INSERT INTO departments (id, name, parent_dept_id, budget, cost_center) VALUES (%s,%s,%s,%s,%s)",
+        depts, many=True)
+    log.info(f"  {len(depts)} departments seeded.")
+
+def seed_employees(conn, n=3000):
+    """Seed employees with manager hierarchy for self-join + window function demos."""
+    log.info(f"Seeding {n} employees...")
+    dept_ids = list(range(7, 21))  # leaf departments
+    # First create managers (top ~200 employees)
+    rows = []
+    for i in range(1, 201):
+        rows.append((
+            fake.first_name(), fake.last_name(), fake.email(),
+            random.choice(dept_ids), None if i <= 20 else random.randint(1, 20),
+            fake.date_between(start_date='-10y', end_date='-2y'),
+            round(random.uniform(80000, 250000), 2),
+            round(random.uniform(2.0, 5.0), 2), 1,
+        ))
+    # Then regular employees
+    for _ in range(n - 200):
+        dept = random.choice(dept_ids)
+        rows.append((
+            fake.first_name(), fake.last_name(), fake.email(),
+            dept, random.randint(1, 200),
+            fake.date_between(start_date='-5y', end_date='now'),
+            round(random.uniform(35000, 150000), 2),
+            round(random.uniform(1.0, 5.0), 2),
+            random.choices([1, 0], weights=[90, 10])[0],
+        ))
+    execute(conn,
+        "INSERT INTO employees (first_name,last_name,email,department_id,manager_id,"
+        "hire_date,salary,performance_score,is_active) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        rows, many=True)
+    log.info("Employees seeded.")
+
+def seed_product_reviews(conn, n=8000):
+    """Seed product reviews with fulltext content for FULLTEXT + aggregation demos."""
+    log.info(f"Seeding {n} product reviews...")
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM products LIMIT 400")
+    prod_ids = [r[0] for r in cur.fetchall()]
+    cur.execute("SELECT id FROM customers LIMIT 1000")
+    cust_ids = [r[0] for r in cur.fetchall()]
+    cur.close()
+    if not prod_ids or not cust_ids:
+        log.warning("No products/customers for reviews.")
+        return
+    sentiments = [
+        "Excellent product, exceeded expectations. Build quality is superb and delivery was fast.",
+        "Terrible experience. Product broke within a week. Would not recommend to anyone.",
+        "Good value for money. Does exactly what it promises. Satisfied with purchase.",
+        "Average quality. Nothing special but does the job. Packaging could be better.",
+        "Outstanding performance and beautiful design. Best purchase I made this year.",
+        "Disappointing quality. The description was misleading. Returning this item.",
+        "Perfect gift idea. My family loved it. Will definitely buy more from this brand.",
+        "Not worth the price. Cheaper alternatives available with same features.",
+        "Incredible durability and comfort. Using it daily for months without any issues.",
+        "Poor customer service when I had issues. Product itself is mediocre at best.",
+        "This is a game changer. Revolutionary features that competitors lack.",
+        "Overpriced for what you get. Expected much better quality at this price point.",
+    ]
+    titles = [
+        "Amazing purchase!", "Total waste of money", "Great value", "Just okay",
+        "Best ever!", "Very disappointed", "Perfect gift", "Not impressed",
+        "Highly recommend", "Buyer beware", "Five stars!", "One star experience",
+        "Solid product", "Could be better", "Exceeded expectations", "Below average",
+    ]
+    rows = []
+    for _ in range(n):
+        rows.append((
+            random.choice(prod_ids), random.choice(cust_ids),
+            random.choices([1, 2, 3, 4, 5], weights=[5, 10, 20, 35, 30])[0],
+            random.choice(titles),
+            random.choice(sentiments) + " " + fake.sentence(),
+            random.randint(0, 200),
+            random.choices([0, 1], weights=[30, 70])[0],
+            fake.date_time_between(start_date='-1y', end_date='now'),
+        ))
+    execute(conn,
+        "INSERT INTO product_reviews (product_id,customer_id,rating,review_title,"
+        "review_text,helpful_votes,verified,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+        rows, many=True)
+    log.info("Product reviews seeded.")
+
+def seed_warehouses_and_stock(conn):
+    """Seed warehouses + stock for multi-table join and inventory demos."""
+    log.info("Seeding warehouses and stock...")
+    wh_data = [
+        ('East Coast Hub', 'East', 'US', 50000),
+        ('West Coast Hub', 'West', 'US', 45000),
+        ('Central Depot', 'Central', 'US', 30000),
+        ('UK Warehouse', 'Europe', 'GB', 25000),
+        ('Frankfurt Depot', 'Europe', 'DE', 35000),
+        ('Tokyo Fulfillment', 'Asia', 'JP', 20000),
+        ('Mumbai Center', 'Asia', 'IN', 28000),
+        ('Sydney Depot', 'Oceania', 'AU', 15000),
+        ('Sao Paulo Hub', 'LatAm', 'BR', 18000),
+        ('Toronto Center', 'NorthAm', 'CA', 22000),
+    ]
+    execute(conn,
+        "INSERT INTO warehouses (name, region, country, capacity) VALUES (%s,%s,%s,%s)",
+        wh_data, many=True)
+
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM products LIMIT 400")
+    prod_ids = [r[0] for r in cur.fetchall()]
+    cur.close()
+
+    stock_rows = []
+    for wh_id in range(1, 11):
+        # Each warehouse carries 60-100% of products
+        products_in_wh = random.sample(prod_ids, max(1, int(len(prod_ids) * random.uniform(0.6, 1.0))))
+        for pid in products_in_wh:
+            qty = random.randint(0, 2000)
+            reserved = random.randint(0, min(qty, 200))
+            stock_rows.append((wh_id, pid, qty, reserved, fake.date_between('-60d', 'today')))
+    execute(conn,
+        "INSERT INTO warehouse_stock (warehouse_id,product_id,quantity,reserved_qty,last_restock_date) "
+        "VALUES (%s,%s,%s,%s,%s)", stock_rows, many=True)
+    log.info(f"  {len(wh_data)} warehouses + {len(stock_rows)} stock rows seeded.")
+
+def seed_suppliers(conn, n=150):
+    """Seed suppliers and product-supplier relationships."""
+    log.info(f"Seeding {n} suppliers...")
+    rows = []
+    for _ in range(n):
+        rows.append((
+            fake.company(), fake.country_code(),
+            round(random.uniform(1.0, 5.0), 2),
+            random.randint(3, 90),
+            random.choices([1, 0], weights=[85, 15])[0],
+        ))
+    execute(conn,
+        "INSERT INTO suppliers (name,country,rating,lead_time_days,is_active) VALUES (%s,%s,%s,%s,%s)",
+        rows, many=True)
+
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM products LIMIT 400")
+    prod_ids = [r[0] for r in cur.fetchall()]
+    cur.close()
+
+    ps_rows = []
+    for pid in prod_ids:
+        n_suppliers = random.randint(1, 4)
+        supplier_ids = random.sample(range(1, n + 1), min(n_suppliers, n))
+        for i, sid in enumerate(supplier_ids):
+            ps_rows.append((pid, sid, round(random.uniform(1.0, 500.0), 2), 1 if i == 0 else 0))
+    execute(conn,
+        "INSERT INTO product_suppliers (product_id,supplier_id,unit_cost,is_primary) VALUES (%s,%s,%s,%s)",
+        ps_rows, many=True)
+    log.info(f"  {n} suppliers + {len(ps_rows)} product_supplier links seeded.")
+
+def seed_payment_transactions(conn):
+    """Seed payment transactions for every order."""
+    log.info("Seeding payment transactions...")
+    cur = conn.cursor()
+    cur.execute("SELECT id, total_amount, status, created_at FROM orders LIMIT 5000")
+    orders = cur.fetchall()
+    cur.close()
+    if not orders:
+        return
+
+    methods = ['credit_card', 'debit_card', 'paypal', 'wire', 'crypto']
+    method_weights = [40, 25, 20, 10, 5]
+    currencies = ['USD', 'EUR', 'GBP', 'INR', 'JPY']
+    statuses_map = {
+        'pending': 'pending',
+        'processing': 'authorized',
+        'shipped': 'captured',
+        'delivered': 'captured',
+        'cancelled': 'refunded',
+    }
+    rows = []
+    for oid, amount, status, created in orders:
+        pay_status = statuses_map.get(status, 'pending')
+        method = random.choices(methods, weights=method_weights)[0]
+        rows.append((
+            oid, method, float(amount) if amount else 0,
+            random.choice(currencies), pay_status,
+            fake.uuid4()[:32],
+            round(random.uniform(0.0, 0.3), 4),
+            created,
+            created + timedelta(seconds=random.randint(1, 300)) if pay_status != 'pending' else None,
+        ))
+        # ~10% of orders have a second transaction (refund or retry)
+        if random.random() < 0.10:
+            rows.append((
+                oid, method, float(amount) * random.uniform(0.1, 1.0) if amount else 0,
+                random.choice(currencies),
+                random.choice(['refunded', 'failed']),
+                fake.uuid4()[:32],
+                round(random.uniform(0.2, 0.9), 4),
+                created + timedelta(days=random.randint(1, 30)),
+                created + timedelta(days=random.randint(1, 30), seconds=random.randint(1, 300)),
+            ))
+    execute(conn,
+        "INSERT INTO payment_transactions (order_id,payment_method,amount,currency,status,"
+        "gateway_ref,fraud_score,created_at,processed_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        rows, many=True)
+    log.info(f"  {len(rows)} payment transactions seeded.")
+
+def seed_promotions(conn, n=50):
+    """Seed promotions and link some orders to promotions."""
+    log.info(f"Seeding {n} promotions...")
+    cats = ['Electronics', 'Clothing', 'Books', 'Home', 'Sports', 'Food', 'Toys', 'Beauty']
+    tiers = [None, 'bronze', 'silver', 'gold', 'platinum']
+    promo_rows = []
+    for i in range(n):
+        valid_from = fake.date_between('-6m', '-1m')
+        valid_until = valid_from + timedelta(days=random.randint(7, 90))
+        promo_rows.append((
+            f"PROMO-{i:04d}", fake.catch_phrase()[:100],
+            random.choice(['percentage', 'fixed', 'buy_x_get_y']),
+            round(random.uniform(5, 40), 2),
+            round(random.uniform(0, 100), 2),
+            random.choice([None, 100, 500, 1000]),
+            0, valid_from, valid_until,
+            random.choice(tiers), random.choice([None] + cats),
+        ))
+    execute(conn,
+        "INSERT INTO promotions (code,description,discount_type,discount_value,min_order_amount,"
+        "max_uses,current_uses,valid_from,valid_until,target_tier,target_category) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", promo_rows, many=True)
+
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM orders LIMIT 5000")
+    oids = [r[0] for r in cur.fetchall()]
+    cur.close()
+
+    op_rows = []
+    for oid in oids:
+        if random.random() < 0.25:  # 25% of orders have a promo
+            pid = random.randint(1, n)
+            op_rows.append((oid, pid, round(random.uniform(2, 50), 2)))
+    execute(conn,
+        "INSERT INTO order_promotions (order_id,promotion_id,discount_amount) VALUES (%s,%s,%s)",
+        op_rows, many=True)
+    log.info(f"  {n} promotions + {len(op_rows)} order_promotion links seeded.")
+
+def seed_inventory_log(conn, n=15000):
+    """Seed inventory log entries for window function + running total demos."""
+    log.info(f"Seeding {n} inventory_log entries...")
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM products LIMIT 200")
+    prod_ids = [r[0] for r in cur.fetchall()]
+    cur.close()
+    if not prod_ids:
+        return
+
+    types = ['receipt', 'sale', 'adjustment', 'transfer', 'return']
+    type_weights = [20, 50, 10, 10, 10]
+    rows = []
+    for _ in range(n):
+        change_type = random.choices(types, weights=type_weights)[0]
+        qty = random.randint(1, 100) if change_type in ('receipt', 'return') else -random.randint(1, 50)
+        if change_type == 'adjustment':
+            qty = random.randint(-20, 20)
+        rows.append((
+            random.choice(prod_ids),
+            random.randint(1, 10),
+            change_type, qty,
+            random.randint(1, 5000),
+            fake.date_time_between(start_date='-6m', end_date='now'),
+        ))
+    execute(conn,
+        "INSERT INTO inventory_log (product_id,warehouse_id,change_type,quantity_change,"
+        "reference_id,created_at) VALUES (%s,%s,%s,%s,%s,%s)", rows, many=True)
+    log.info("Inventory log seeded.")
+
+def seed_all_new_tables(conn):
+    """Seed all new tables required for complex explain plan scenarios."""
+    seed_product_categories(conn)
+    seed_departments(conn)
+    seed_employees(conn)
+    seed_product_reviews(conn)
+    seed_warehouses_and_stock(conn)
+    seed_suppliers(conn)
+    seed_payment_transactions(conn)
+    seed_promotions(conn)
+    seed_inventory_log(conn)
+
 # =============================================================================
 # DATA CLEANUP — Remove data older than N days
 # =============================================================================
@@ -547,6 +1063,18 @@ def cleanup_old_data(cfg, days=10):
         products_deleted = cur.rowcount
         conn.commit()
         log.info(f"  Deleted {products_deleted} orphaned products")
+
+        # 9. Clean up new tables (time-based entries)
+        for tbl, col in [('product_reviews', 'created_at'), ('inventory_log', 'created_at'),
+                          ('payment_transactions', 'created_at')]:
+            try:
+                cur.execute(f"DELETE FROM {tbl} WHERE {col} < %s", (cutoff_str,))
+                cnt = cur.rowcount
+                conn.commit()
+                if cnt > 0:
+                    log.info(f"  Deleted {cnt} rows from {tbl}")
+            except Error:
+                pass
 
         cur.close()
 
@@ -1285,229 +1813,712 @@ def scenario_query_drift(cfg, iterations_before=20, iterations_after=30):
     log.info("✔ Scenario 18 done.")
 
 # =============================================================================
-# SCENARIO 19 — Complex Explain Plans (deep node trees for visualizer demos)
-# Dynatrace: Multi-node explain plans with subqueries, 5+ table joins,
-#            derived tables, UNIONs, and GROUP BY/HAVING
+# SCENARIO 19 — Complex Explain Plans (comprehensive coverage of ALL plan types)
+# Dynatrace: Multi-node explain plans covering every access type (const, eq_ref,
+#   ref, range, index, ALL, fulltext, index_merge), every select type (SIMPLE,
+#   PRIMARY, SUBQUERY, DEPENDENT SUBQUERY, DERIVED, UNION, MATERIALIZED),
+#   and every Extra (Using index, Using temporary, Using filesort, Using join
+#   buffer, Using index condition, FirstMatch, LooseScan, etc.)
+# Uses 19 tables with deep hierarchies, self-joins, CTEs, window functions,
+#   fulltext search, semi-joins, anti-joins, and 8-10 table join chains.
 # =============================================================================
 
-def scenario_complex_plans(cfg, iterations=10):
-    log.info("▶ SCENARIO 19: Complex explain plans (deep node trees)")
+def scenario_complex_plans(cfg, iterations=8):
+    log.info("▶ SCENARIO 19: Complex explain plans (25 query patterns, all plan types)")
     conn = get_connection(cfg)
 
-    # ── 1. Correlated subquery with nested scalar subquery (select_id 1,2,3) ──
-    subquery_sql = """
-        SELECT c.id, c.email, c.tier,
-               (SELECT COUNT(*)
-                FROM orders o
-                WHERE o.customer_id = c.id
-                  AND o.status IN ('shipped','delivered')) AS completed_orders,
-               (SELECT COALESCE(SUM(oi.quantity * oi.unit_price), 0)
-                FROM order_items oi
-                WHERE oi.order_id IN (
-                    SELECT o2.id FROM orders o2 WHERE o2.customer_id = c.id
-                )) AS lifetime_value
-        FROM customers c
-        WHERE c.tier IN ('gold','platinum')
-          AND EXISTS (
-              SELECT 1 FROM orders o3
-              WHERE o3.customer_id = c.id
-                AND o3.created_at >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
-          )
-        ORDER BY lifetime_value DESC
-        LIMIT 50
+    # ── Q1: Recursive CTE — category hierarchy traversal ─────────────────
+    # EXPLAIN: DERIVED + UNION + recursive materialization
+    q01_recursive_cte = """
+        WITH RECURSIVE cat_tree AS (
+            SELECT id, name, parent_id, depth, path,
+                   CAST(name AS CHAR(500)) AS full_path
+            FROM product_categories
+            WHERE parent_id IS NULL
+            UNION ALL
+            SELECT c.id, c.name, c.parent_id, c.depth, c.path,
+                   CONCAT(ct.full_path, ' > ', c.name)
+            FROM product_categories c
+            JOIN cat_tree ct ON ct.id = c.parent_id
+        )
+        SELECT ct.full_path, ct.depth, COUNT(p.id) AS product_count,
+               COALESCE(SUM(p.price), 0) AS total_value
+        FROM cat_tree ct
+        LEFT JOIN products p ON p.category = ct.name
+        GROUP BY ct.id, ct.full_path, ct.depth
+        HAVING product_count > 0
+        ORDER BY ct.depth, total_value DESC
     """
 
-    # ── 2. Five-table JOIN with aggregation (5-node nested_loop) ──────────
-    five_join_sql = """
-        SELECT c.country, c.tier,
-               p.category,
-               COUNT(DISTINCT o.id) AS order_count,
-               SUM(oi.quantity) AS total_items,
-               SUM(oi.quantity * oi.unit_price) AS gross_revenue,
-               AVG(sf.revenue) AS avg_fact_revenue,
-               MAX(o.created_at) AS last_order_date
+    # ── Q2: Recursive CTE — employee management chain (self-join hierarchy) ──
+    # EXPLAIN: DERIVED + recursive + self-join on manager_id
+    q02_mgmt_chain = """
+        WITH RECURSIVE mgmt_chain AS (
+            SELECT id, first_name, last_name, manager_id, department_id,
+                   salary, 1 AS chain_level,
+                   CAST(CONCAT(first_name, ' ', last_name) AS CHAR(1000)) AS chain_path
+            FROM employees
+            WHERE manager_id IS NULL AND is_active = 1
+            UNION ALL
+            SELECT e.id, e.first_name, e.last_name, e.manager_id, e.department_id,
+                   e.salary, mc.chain_level + 1,
+                   CONCAT(mc.chain_path, ' > ', e.first_name, ' ', e.last_name)
+            FROM employees e
+            JOIN mgmt_chain mc ON mc.id = e.manager_id
+            WHERE e.is_active = 1
+        )
+        SELECT mc.chain_level,
+               COUNT(*) AS employee_count,
+               AVG(mc.salary) AS avg_salary,
+               MAX(mc.salary) AS max_salary,
+               d.name AS department_name
+        FROM mgmt_chain mc
+        JOIN departments d ON d.id = mc.department_id
+        GROUP BY mc.chain_level, d.name
+        ORDER BY mc.chain_level, avg_salary DESC
+    """
+
+    # ── Q3: 10-table JOIN chain — full order lifecycle ────────────────────
+    # EXPLAIN: 10 nested_loop nodes, mix of eq_ref/ref/ALL
+    q03_ten_table_join = """
+        SELECT c.email, c.tier, c.country,
+               o.id AS order_id, o.status, o.total_amount,
+               oi.quantity, oi.unit_price,
+               p.name AS product_name, p.category, p.sku,
+               pr.rating AS review_rating, pr.review_title,
+               pt.payment_method, pt.status AS payment_status, pt.fraud_score,
+               ws.quantity AS warehouse_qty, w.name AS warehouse_name, w.region,
+               sup.name AS supplier_name, sup.lead_time_days,
+               promo.code AS promo_code, op.discount_amount
         FROM customers c
-        JOIN orders o       ON o.customer_id = c.id
-        JOIN order_items oi ON oi.order_id = o.id
-        JOIN products p     ON p.id = oi.product_id
-        JOIN sales_facts sf ON sf.order_id = o.id AND sf.product_id = p.id
-        WHERE c.country IN ('US','GB','DE','IN','FR')
-          AND o.status != 'cancelled'
-          AND p.price > 10.00
-        GROUP BY c.country, c.tier, p.category
-        HAVING gross_revenue > 100
-        ORDER BY gross_revenue DESC
+        JOIN orders o            ON o.customer_id = c.id
+        JOIN order_items oi      ON oi.order_id = o.id
+        JOIN products p          ON p.id = oi.product_id
+        LEFT JOIN product_reviews pr ON pr.product_id = p.id AND pr.customer_id = c.id
+        JOIN payment_transactions pt ON pt.order_id = o.id
+        LEFT JOIN warehouse_stock ws ON ws.product_id = p.id
+        LEFT JOIN warehouses w       ON w.id = ws.warehouse_id
+        LEFT JOIN product_suppliers ps ON ps.product_id = p.id AND ps.is_primary = 1
+        LEFT JOIN suppliers sup      ON sup.id = ps.supplier_id
+        LEFT JOIN order_promotions op ON op.order_id = o.id
+        LEFT JOIN promotions promo   ON promo.id = op.promotion_id
+        WHERE c.country IN ('US', 'GB', 'DE')
+          AND o.status IN ('shipped', 'delivered')
+          AND p.price > 20.00
+        ORDER BY o.total_amount DESC
         LIMIT 100
     """
 
-    # ── 3. Derived table / subquery in FROM (materialized_from_subquery) ──
-    derived_sql = """
-        SELECT ranked.country, ranked.tier,
-               ranked.total_revenue, ranked.customer_count,
-               ranked.total_revenue / ranked.customer_count AS revenue_per_customer,
-               p_stats.top_category, p_stats.category_revenue
-        FROM (
-            SELECT c.country, c.tier,
-                   SUM(o.total_amount) AS total_revenue,
-                   COUNT(DISTINCT c.id) AS customer_count
-            FROM customers c
-            JOIN orders o ON o.customer_id = c.id
-            WHERE o.status IN ('shipped','delivered')
-            GROUP BY c.country, c.tier
-            HAVING total_revenue > 50
-        ) AS ranked
-        JOIN (
-            SELECT sf.country, sf.tier, sf.category AS top_category,
-                   SUM(sf.revenue) AS category_revenue,
-                   ROW_NUMBER() OVER (PARTITION BY sf.country, sf.tier ORDER BY SUM(sf.revenue) DESC) AS rn
-            FROM sales_facts sf
-            GROUP BY sf.country, sf.tier, sf.category
-        ) AS p_stats ON p_stats.country = ranked.country
-                     AND p_stats.tier = ranked.tier
-                     AND p_stats.rn = 1
-        ORDER BY ranked.total_revenue DESC
+    # ── Q4: Employee self-join 3 levels — org chart query ─────────────────
+    # EXPLAIN: 3 self-joins on employees, each eq_ref or ref
+    q04_self_join_3lvl = """
+        SELECT e.first_name AS employee,
+               e.salary AS emp_salary,
+               mgr.first_name AS manager,
+               mgr.salary AS mgr_salary,
+               dir.first_name AS director,
+               dir.salary AS dir_salary,
+               d.name AS department,
+               d.budget AS dept_budget,
+               e.salary / d.budget * 100 AS salary_pct_of_budget
+        FROM employees e
+        JOIN employees mgr   ON mgr.id = e.manager_id
+        JOIN employees dir   ON dir.id = mgr.manager_id
+        JOIN departments d   ON d.id = e.department_id
+        WHERE e.is_active = 1
+          AND e.performance_score >= 3.5
+          AND e.salary > mgr.salary * 0.8
+        ORDER BY e.salary DESC
         LIMIT 50
     """
 
-    # ── 4. UNION of multiple query branches (union_result) ────────────────
-    union_sql = """
-        SELECT 'high_value_customer' AS segment, c.id, c.email,
-               SUM(o.total_amount) AS metric_value
+    # ── Q5: Semi-join with EXISTS — FirstMatch/LooseScan optimization ─────
+    # EXPLAIN: FirstMatch or MaterializeScan in Extra
+    q05_semijoin_exists = """
+        SELECT c.id, c.email, c.tier, c.country
         FROM customers c
-        JOIN orders o ON o.customer_id = c.id
-        WHERE c.tier = 'platinum'
-        GROUP BY c.id, c.email
-        HAVING metric_value > 500
+        WHERE EXISTS (
+            SELECT 1 FROM orders o
+            WHERE o.customer_id = c.id
+              AND o.status = 'delivered'
+              AND o.total_amount > 200
+        )
+        AND EXISTS (
+            SELECT 1 FROM product_reviews pr
+            JOIN order_items oi ON oi.product_id = pr.product_id
+            JOIN orders o2 ON o2.id = oi.order_id AND o2.customer_id = c.id
+            WHERE pr.rating >= 4
+        )
+        AND c.tier IN ('gold', 'platinum')
+        ORDER BY c.created_at DESC
+        LIMIT 50
+    """
+
+    # ── Q6: Semi-join with IN + subquery — Materialize optimization ──────
+    # EXPLAIN: MATERIALIZED select_type, materialized subquery
+    q06_semijoin_in = """
+        SELECT p.id, p.name, p.category, p.price, p.stock_qty
+        FROM products p
+        WHERE p.id IN (
+            SELECT oi.product_id
+            FROM order_items oi
+            JOIN orders o ON o.id = oi.order_id
+            WHERE o.status = 'delivered'
+              AND o.created_at >= DATE_SUB(NOW(), INTERVAL 3 MONTH)
+        )
+        AND p.id IN (
+            SELECT pr.product_id
+            FROM product_reviews pr
+            WHERE pr.rating >= 4 AND pr.verified = 1
+            GROUP BY pr.product_id
+            HAVING COUNT(*) >= 2
+        )
+        AND p.price BETWEEN 10 AND 500
+        ORDER BY p.stock_qty ASC
+        LIMIT 100
+    """
+
+    # ── Q7: NOT EXISTS anti-join vs LEFT JOIN IS NULL comparison ──────────
+    # EXPLAIN: anti-join optimization, LEFT JOIN + IS NULL
+    q07_antijoin = """
+        SELECT c.id, c.email, c.tier, c.created_at,
+               DATEDIFF(NOW(), c.created_at) AS account_age_days
+        FROM customers c
+        WHERE NOT EXISTS (
+            SELECT 1 FROM orders o WHERE o.customer_id = c.id
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM sessions s
+            WHERE s.customer_id = c.id
+              AND s.created_at >= DATE_SUB(NOW(), INTERVAL 60 DAY)
+        )
+        AND c.created_at < DATE_SUB(NOW(), INTERVAL 30 DAY)
+        ORDER BY c.created_at ASC
+        LIMIT 100
+    """
+
+    # ── Q8: Correlated subquery 4 levels deep ────────────────────────────
+    # EXPLAIN: DEPENDENT SUBQUERY at multiple levels, select_id 1-4
+    q08_correlated_4deep = """
+        SELECT c.id, c.email, c.tier,
+            (SELECT COUNT(DISTINCT o.id)
+             FROM orders o
+             WHERE o.customer_id = c.id
+               AND o.total_amount > (
+                   SELECT AVG(o2.total_amount) * 1.5
+                   FROM orders o2
+                   WHERE o2.customer_id = c.id
+               )
+               AND EXISTS (
+                   SELECT 1 FROM order_items oi
+                   WHERE oi.order_id = o.id
+                     AND oi.unit_price > (
+                         SELECT AVG(p.price)
+                         FROM products p
+                         WHERE p.category = (
+                             SELECT p2.category FROM products p2
+                             JOIN order_items oi2 ON oi2.product_id = p2.id
+                             WHERE oi2.order_id = o.id
+                             LIMIT 1
+                         )
+                     )
+               )
+            ) AS premium_order_count
+        FROM customers c
+        WHERE c.tier IN ('gold', 'platinum')
+        ORDER BY premium_order_count DESC
+        LIMIT 30
+    """
+
+    # ── Q9: Window functions — RANK, ROW_NUMBER, LAG, LEAD, running totals ─
+    # EXPLAIN: DERIVED with window function materialization
+    q09_window_functions = """
+        SELECT *
+        FROM (
+            SELECT e.id, e.first_name, e.last_name,
+                   d.name AS department,
+                   e.salary,
+                   RANK() OVER (PARTITION BY e.department_id ORDER BY e.salary DESC) AS salary_rank,
+                   ROW_NUMBER() OVER (PARTITION BY e.department_id ORDER BY e.hire_date) AS seniority_num,
+                   e.salary - LAG(e.salary) OVER (PARTITION BY e.department_id ORDER BY e.salary) AS salary_gap_to_prev,
+                   LEAD(e.first_name) OVER (PARTITION BY e.department_id ORDER BY e.salary DESC) AS next_lower_paid,
+                   SUM(e.salary) OVER (PARTITION BY e.department_id ORDER BY e.salary DESC
+                                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_salary_total,
+                   AVG(e.salary) OVER (PARTITION BY e.department_id) AS dept_avg_salary,
+                   COUNT(*) OVER (PARTITION BY e.department_id) AS dept_headcount,
+                   e.salary / AVG(e.salary) OVER (PARTITION BY e.department_id) AS salary_vs_avg_ratio
+            FROM employees e
+            JOIN departments d ON d.id = e.department_id
+            WHERE e.is_active = 1
+        ) AS ranked
+        WHERE salary_rank <= 5
+        ORDER BY department, salary_rank
+    """
+
+    # ── Q10: FULLTEXT search with relevance ranking + joins ──────────────
+    # EXPLAIN: type=fulltext, ft_review index
+    q10_fulltext = """
+        SELECT p.id, p.name, p.category, p.price,
+               pr.review_title, pr.review_text,
+               MATCH(pr.review_title, pr.review_text) AGAINST('excellent quality durable' IN NATURAL LANGUAGE MODE) AS relevance,
+               pr.rating, pr.helpful_votes,
+               c.email AS reviewer_email,
+               sup.name AS supplier_name
+        FROM product_reviews pr
+        JOIN products p ON p.id = pr.product_id
+        JOIN customers c ON c.id = pr.customer_id
+        LEFT JOIN product_suppliers ps ON ps.product_id = p.id AND ps.is_primary = 1
+        LEFT JOIN suppliers sup ON sup.id = ps.supplier_id
+        WHERE MATCH(pr.review_title, pr.review_text) AGAINST('excellent quality durable' IN NATURAL LANGUAGE MODE)
+          AND pr.verified = 1
+        ORDER BY relevance DESC, pr.helpful_votes DESC
+        LIMIT 50
+    """
+
+    # ── Q11: Index merge (intersection) — multiple single-column indexes ──
+    # EXPLAIN: type=index_merge, Using intersect(idx_a, idx_b)
+    q11_index_merge = """
+        SELECT id, first_name, last_name, email, salary, hire_date
+        FROM employees
+        WHERE department_id = 7
+          AND salary > 100000
+          AND is_active = 1
+        ORDER BY salary DESC
+    """
+
+    # ── Q12: Covering index scan — Using index only ──────────────────────
+    # EXPLAIN: Extra = Using index (no table lookup needed)
+    q12_covering_index = """
+        SELECT product_id, rating
+        FROM product_reviews
+        WHERE product_id BETWEEN 10 AND 50
+          AND rating >= 4
+    """
+
+    # ── Q13: UNION ALL with 4 diverse branches ──────────────────────────
+    # EXPLAIN: PRIMARY, UNION, UNION RESULT, DERIVED select types
+    q13_union_4branch = """
+        (SELECT 'top_spender' AS segment, c.id, c.email,
+                SUM(o.total_amount) AS metric_value, c.country
+         FROM customers c
+         JOIN orders o ON o.customer_id = c.id
+         WHERE o.status = 'delivered'
+         GROUP BY c.id, c.email, c.country
+         HAVING metric_value > 500)
 
         UNION ALL
 
-        SELECT 'frequent_buyer' AS segment, c.id, c.email,
-               COUNT(o.id) AS metric_value
-        FROM customers c
-        JOIN orders o ON o.customer_id = c.id
-        WHERE o.created_at >= DATE_SUB(NOW(), INTERVAL 3 MONTH)
-        GROUP BY c.id, c.email
-        HAVING metric_value > 5
+        (SELECT 'prolific_reviewer' AS segment, c.id, c.email,
+                COUNT(pr.id) AS metric_value, c.country
+         FROM customers c
+         JOIN product_reviews pr ON pr.customer_id = c.id
+         WHERE pr.verified = 1
+         GROUP BY c.id, c.email, c.country
+         HAVING metric_value >= 5)
 
         UNION ALL
 
-        SELECT 'big_basket' AS segment, c.id, c.email,
-               MAX(item_counts.item_count) AS metric_value
-        FROM customers c
-        JOIN orders o ON o.customer_id = c.id
-        JOIN (
-            SELECT order_id, COUNT(*) AS item_count
-            FROM order_items
-            GROUP BY order_id
-        ) AS item_counts ON item_counts.order_id = o.id
-        GROUP BY c.id, c.email
-        HAVING metric_value > 3
+        (SELECT 'multi_method_payer' AS segment, c.id, c.email,
+                COUNT(DISTINCT pt.payment_method) AS metric_value, c.country
+         FROM customers c
+         JOIN orders o ON o.customer_id = c.id
+         JOIN payment_transactions pt ON pt.order_id = o.id
+         GROUP BY c.id, c.email, c.country
+         HAVING metric_value >= 3)
+
+        UNION ALL
+
+        (SELECT 'promo_hunter' AS segment, c.id, c.email,
+                COUNT(DISTINCT op.promotion_id) AS metric_value, c.country
+         FROM customers c
+         JOIN orders o ON o.customer_id = c.id
+         JOIN order_promotions op ON op.order_id = o.id
+         GROUP BY c.id, c.email, c.country
+         HAVING metric_value >= 2)
 
         ORDER BY metric_value DESC
         LIMIT 100
     """
 
-    # ── 5. Multi-level GROUP BY + HAVING with window function ─────────────
-    grouping_sql = """
-        SELECT category_stats.*,
-               CASE
-                   WHEN category_stats.avg_order_value > 200 THEN 'premium'
-                   WHEN category_stats.avg_order_value > 50  THEN 'standard'
-                   ELSE 'budget'
-               END AS price_segment
+    # ── Q14: Multi-level aggregation (aggregation of aggregation) ────────
+    # EXPLAIN: 2 DERIVED layers, Using temporary + Using filesort
+    q14_multi_agg = """
+        SELECT region_summary.region,
+               AVG(region_summary.warehouse_revenue) AS avg_warehouse_revenue,
+               SUM(region_summary.warehouse_revenue) AS total_region_revenue,
+               MAX(region_summary.product_count) AS max_products_per_warehouse,
+               COUNT(*) AS warehouse_count
         FROM (
-            SELECT p.category,
-                   c.country,
-                   COUNT(DISTINCT o.id) AS order_count,
-                   COUNT(DISTINCT c.id) AS unique_customers,
-                   SUM(oi.quantity * oi.unit_price) AS total_revenue,
-                   AVG(o.total_amount) AS avg_order_value,
-                   SUM(oi.quantity) AS total_units_sold,
-                   MAX(o.created_at) AS most_recent_order
-            FROM products p
-            JOIN order_items oi ON oi.product_id = p.id
-            JOIN orders o       ON o.id = oi.order_id
-            JOIN customers c    ON c.id = o.customer_id
-            WHERE o.created_at >= DATE_SUB(NOW(), INTERVAL 1 YEAR)
-              AND o.status != 'cancelled'
-            GROUP BY p.category, c.country
-            HAVING order_count >= 2
-               AND total_revenue > 10
-        ) AS category_stats
-        ORDER BY category_stats.total_revenue DESC
+            SELECT w.region, w.name AS warehouse_name,
+                   COUNT(DISTINCT ws.product_id) AS product_count,
+                   SUM(ws.quantity * p.price) AS warehouse_revenue,
+                   AVG(ws.quantity) AS avg_stock_level
+            FROM warehouses w
+            JOIN warehouse_stock ws ON ws.warehouse_id = w.id
+            JOIN products p ON p.id = ws.product_id
+            WHERE ws.quantity > 0
+            GROUP BY w.id, w.region, w.name
+            HAVING warehouse_revenue > 100
+        ) AS region_summary
+        GROUP BY region_summary.region
+        ORDER BY total_region_revenue DESC
+    """
+
+    # ── Q15: Pivot via conditional aggregation — cross-tab report ────────
+    # EXPLAIN: Multi-table JOIN + GROUP BY + CASE aggregation + filesort
+    q15_pivot = """
+        SELECT p.category,
+               COUNT(CASE WHEN c.tier = 'bronze'   THEN 1 END) AS bronze_orders,
+               COUNT(CASE WHEN c.tier = 'silver'   THEN 1 END) AS silver_orders,
+               COUNT(CASE WHEN c.tier = 'gold'     THEN 1 END) AS gold_orders,
+               COUNT(CASE WHEN c.tier = 'platinum' THEN 1 END) AS platinum_orders,
+               SUM(CASE WHEN c.tier = 'platinum' THEN oi.quantity * oi.unit_price ELSE 0 END) AS platinum_revenue,
+               SUM(CASE WHEN c.tier = 'gold' THEN oi.quantity * oi.unit_price ELSE 0 END) AS gold_revenue,
+               AVG(CASE WHEN pr.rating IS NOT NULL THEN pr.rating END) AS avg_review_rating,
+               COUNT(DISTINCT sup.id) AS supplier_count
+        FROM products p
+        JOIN order_items oi ON oi.product_id = p.id
+        JOIN orders o ON o.id = oi.order_id
+        JOIN customers c ON c.id = o.customer_id
+        LEFT JOIN product_reviews pr ON pr.product_id = p.id
+        LEFT JOIN product_suppliers ps ON ps.product_id = p.id
+        LEFT JOIN suppliers sup ON sup.id = ps.supplier_id
+        WHERE o.status NOT IN ('cancelled')
+        GROUP BY p.category
+        ORDER BY platinum_revenue DESC
+    """
+
+    # ── Q16: Subquery with ALL/ANY range comparison ──────────────────────
+    # EXPLAIN: SUBQUERY + range comparison, dependent/non-dependent
+    q16_all_any = """
+        SELECT e.id, e.first_name, e.last_name, e.salary,
+               d.name AS department, d.budget
+        FROM employees e
+        JOIN departments d ON d.id = e.department_id
+        WHERE e.salary > ALL (
+            SELECT AVG(e2.salary)
+            FROM employees e2
+            WHERE e2.department_id != e.department_id
+              AND e2.is_active = 1
+            GROUP BY e2.department_id
+        )
+        AND e.performance_score >= ANY (
+            SELECT MAX(e3.performance_score) - 0.5
+            FROM employees e3
+            WHERE e3.department_id = e.department_id
+        )
+        ORDER BY e.salary DESC
+        LIMIT 20
+    """
+
+    # ── Q17: Inventory running totals with window frames ─────────────────
+    # EXPLAIN: DERIVED with complex window, filesort for ORDER BY
+    q17_running_totals = """
+        SELECT inv.*,
+               p.name AS product_name, p.category,
+               w.name AS warehouse_name
+        FROM (
+            SELECT il.product_id, il.warehouse_id,
+                   il.change_type, il.quantity_change,
+                   il.created_at,
+                   SUM(il.quantity_change) OVER (
+                       PARTITION BY il.product_id, il.warehouse_id
+                       ORDER BY il.created_at
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                   ) AS running_balance,
+                   AVG(il.quantity_change) OVER (
+                       PARTITION BY il.product_id, il.warehouse_id
+                       ORDER BY il.created_at
+                       ROWS BETWEEN 5 PRECEDING AND CURRENT ROW
+                   ) AS moving_avg_6,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY il.product_id, il.warehouse_id
+                       ORDER BY il.created_at DESC
+                   ) AS recency_rank
+            FROM inventory_log il
+            WHERE il.created_at >= DATE_SUB(NOW(), INTERVAL 3 MONTH)
+        ) AS inv
+        JOIN products p ON p.id = inv.product_id
+        JOIN warehouses w ON w.id = inv.warehouse_id
+        WHERE inv.recency_rank <= 10
+        ORDER BY inv.product_id, inv.warehouse_id, inv.created_at DESC
         LIMIT 200
     """
 
-    # ── 6. Complex subquery with EXISTS, IN, and JOIN (deeply nested) ─────
-    nested_sql = """
-        SELECT c.id, c.email, c.first_name, c.last_name, c.tier,
-               order_summary.order_count, order_summary.total_spent
+    # ── Q18: Complex CASE with scalar subqueries per row ─────────────────
+    # EXPLAIN: Multiple DEPENDENT SUBQUERY nodes, heavy per-row overhead
+    q18_case_subqueries = """
+        SELECT p.id, p.name, p.category, p.price,
+               CASE
+                   WHEN (SELECT AVG(pr.rating) FROM product_reviews pr WHERE pr.product_id = p.id) >= 4.5
+                        AND (SELECT COUNT(*) FROM product_reviews pr2 WHERE pr2.product_id = p.id) >= 10
+                   THEN 'star_product'
+                   WHEN (SELECT SUM(oi.quantity) FROM order_items oi WHERE oi.product_id = p.id) >
+                        (SELECT AVG(total_qty) FROM (
+                            SELECT SUM(oi2.quantity) AS total_qty
+                            FROM order_items oi2
+                            GROUP BY oi2.product_id
+                        ) AS avg_sales)
+                   THEN 'high_volume'
+                   WHEN (SELECT COUNT(DISTINCT ws.warehouse_id) FROM warehouse_stock ws WHERE ws.product_id = p.id AND ws.quantity > 0) >= 5
+                   THEN 'widely_stocked'
+                   ELSE 'standard'
+               END AS product_tier,
+               (SELECT GROUP_CONCAT(DISTINCT sup.country ORDER BY sup.country)
+                FROM product_suppliers ps2
+                JOIN suppliers sup ON sup.id = ps2.supplier_id
+                WHERE ps2.product_id = p.id) AS supplier_countries
+        FROM products p
+        WHERE p.price > 10
+        ORDER BY p.price DESC
+        LIMIT 100
+    """
+
+    # ── Q19: Non-recursive CTE with multiple references ──────────────────
+    # EXPLAIN: CTE materialized once, referenced twice
+    q19_cte_multi_ref = """
+        WITH customer_metrics AS (
+            SELECT c.id AS customer_id, c.email, c.tier, c.country,
+                   COUNT(DISTINCT o.id) AS order_count,
+                   COALESCE(SUM(o.total_amount), 0) AS total_spent,
+                   MAX(o.created_at) AS last_order_date
+            FROM customers c
+            LEFT JOIN orders o ON o.customer_id = c.id AND o.status != 'cancelled'
+            GROUP BY c.id, c.email, c.tier, c.country
+        ),
+        tier_benchmarks AS (
+            SELECT tier,
+                   AVG(total_spent) AS avg_spent,
+                   AVG(order_count) AS avg_orders,
+                   MAX(total_spent) AS max_spent,
+                   MIN(total_spent) AS min_spent
+            FROM customer_metrics
+            GROUP BY tier
+        )
+        SELECT cm.customer_id, cm.email, cm.tier, cm.country,
+               cm.order_count, cm.total_spent,
+               tb.avg_spent AS tier_avg_spent,
+               cm.total_spent - tb.avg_spent AS vs_tier_avg,
+               CASE WHEN cm.total_spent > tb.avg_spent * 2 THEN 'whale'
+                    WHEN cm.total_spent > tb.avg_spent     THEN 'above_avg'
+                    ELSE 'below_avg'
+               END AS classification
+        FROM customer_metrics cm
+        JOIN tier_benchmarks tb ON tb.tier = cm.tier
+        WHERE cm.order_count > 0
+        ORDER BY cm.total_spent DESC
+        LIMIT 100
+    """
+
+    # ── Q20: Complex UPDATE with subquery (DML explain) ──────────────────
+    # EXPLAIN: Shows UPDATE plan with subquery for SET and WHERE
+    q20_update_subquery = """
+        SELECT p.id, p.stock_qty,
+            (SELECT COALESCE(SUM(ws.quantity - ws.reserved_qty), 0)
+             FROM warehouse_stock ws
+             WHERE ws.product_id = p.id) AS available_stock,
+            (SELECT COUNT(DISTINCT oi.order_id)
+             FROM order_items oi
+             JOIN orders o ON o.id = oi.order_id
+             WHERE oi.product_id = p.id
+               AND o.status = 'pending') AS pending_orders
+        FROM products p
+        WHERE p.stock_qty != (
+            SELECT COALESCE(SUM(ws2.quantity - ws2.reserved_qty), 0)
+            FROM warehouse_stock ws2
+            WHERE ws2.product_id = p.id
+        )
+        LIMIT 50
+    """
+
+    # ── Q21: 8-table supply chain analytics ──────────────────────────────
+    # EXPLAIN: 8 tables joined, mix of INNER/LEFT, aggregation, filesort
+    q21_supply_chain = """
+        SELECT sup.name AS supplier_name, sup.country AS supplier_country,
+               sup.rating AS supplier_rating, sup.lead_time_days,
+               COUNT(DISTINCT p.id) AS products_supplied,
+               COUNT(DISTINCT o.id) AS orders_fulfilled,
+               SUM(oi.quantity * oi.unit_price) AS total_revenue_generated,
+               AVG(pr.rating) AS avg_product_rating,
+               SUM(ws.quantity) AS total_warehouse_stock,
+               COUNT(DISTINCT w.id) AS warehouses_stocked
+        FROM suppliers sup
+        JOIN product_suppliers ps ON ps.supplier_id = sup.id
+        JOIN products p ON p.id = ps.product_id
+        JOIN order_items oi ON oi.product_id = p.id
+        JOIN orders o ON o.id = oi.order_id AND o.status IN ('shipped', 'delivered')
+        LEFT JOIN product_reviews pr ON pr.product_id = p.id AND pr.verified = 1
+        LEFT JOIN warehouse_stock ws ON ws.product_id = p.id AND ws.quantity > 0
+        LEFT JOIN warehouses w ON w.id = ws.warehouse_id
+        WHERE sup.is_active = 1
+        GROUP BY sup.id, sup.name, sup.country, sup.rating, sup.lead_time_days
+        HAVING total_revenue_generated > 100
+        ORDER BY total_revenue_generated DESC
+        LIMIT 50
+    """
+
+    # ── Q22: DEPENDENT UNION — correlated union branches ─────────────────
+    # EXPLAIN: DEPENDENT UNION select_type
+    q22_dependent_union = """
+        SELECT c.id, c.email, c.tier,
+               (SELECT MAX(val) FROM (
+                   SELECT SUM(o.total_amount) AS val
+                   FROM orders o
+                   WHERE o.customer_id = c.id AND o.status = 'delivered'
+                   UNION ALL
+                   SELECT COUNT(*) * 100 AS val
+                   FROM product_reviews pr
+                   WHERE pr.customer_id = c.id AND pr.rating = 5
+                   UNION ALL
+                   SELECT COUNT(DISTINCT s.id) * 50 AS val
+                   FROM sessions s
+                   WHERE s.customer_id = c.id
+               ) AS scores) AS engagement_score
+        FROM customers c
+        WHERE c.tier IN ('gold', 'platinum')
+        ORDER BY engagement_score DESC
+        LIMIT 50
+    """
+
+    # ── Q23: Fraud detection — complex multi-table analytics ─────────────
+    # EXPLAIN: 7 tables, subqueries in WHERE, HAVING, derived tables
+    q23_fraud_detection = """
+        SELECT c.id AS customer_id, c.email, c.tier, c.country,
+               order_stats.order_count,
+               order_stats.total_amount,
+               payment_stats.failed_payments,
+               payment_stats.avg_fraud_score,
+               review_stats.review_count,
+               review_stats.avg_rating
         FROM customers c
         JOIN (
             SELECT o.customer_id,
                    COUNT(*) AS order_count,
-                   SUM(o.total_amount) AS total_spent
+                   SUM(o.total_amount) AS total_amount,
+                   AVG(o.total_amount) AS avg_order_value
             FROM orders o
-            WHERE o.status IN ('shipped','delivered')
+            WHERE o.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
             GROUP BY o.customer_id
-        ) AS order_summary ON order_summary.customer_id = c.id
-        WHERE c.tier IN ('gold','platinum')
-          AND order_summary.total_spent > (
-              SELECT AVG(sub_total.customer_total) * 1.5
-              FROM (
-                  SELECT SUM(o2.total_amount) AS customer_total
-                  FROM orders o2
-                  WHERE o2.status IN ('shipped','delivered')
-                  GROUP BY o2.customer_id
-              ) AS sub_total
-          )
-          AND EXISTS (
-              SELECT 1
-              FROM order_items oi
-              JOIN products p ON p.id = oi.product_id
-              WHERE oi.order_id IN (SELECT id FROM orders WHERE customer_id = c.id)
-                AND p.category = 'Electronics'
-          )
-        ORDER BY order_summary.total_spent DESC
-        LIMIT 25
-    """
-
-    # ── 7. Anti-join pattern with LEFT JOIN / IS NULL + subquery ──────────
-    antijoin_sql = """
-        SELECT c.id, c.email, c.tier, c.created_at,
-               last_order.last_order_date,
-               DATEDIFF(NOW(), COALESCE(last_order.last_order_date, c.created_at)) AS days_inactive
-        FROM customers c
+            HAVING order_count >= 3
+        ) AS order_stats ON order_stats.customer_id = c.id
+        JOIN (
+            SELECT o2.customer_id,
+                   SUM(CASE WHEN pt.status = 'failed' THEN 1 ELSE 0 END) AS failed_payments,
+                   AVG(pt.fraud_score) AS avg_fraud_score,
+                   COUNT(DISTINCT pt.payment_method) AS methods_used
+            FROM payment_transactions pt
+            JOIN orders o2 ON o2.id = pt.order_id
+            GROUP BY o2.customer_id
+        ) AS payment_stats ON payment_stats.customer_id = c.id
         LEFT JOIN (
-            SELECT customer_id, MAX(created_at) AS last_order_date
-            FROM orders
-            GROUP BY customer_id
-        ) AS last_order ON last_order.customer_id = c.id
-        WHERE c.tier IN ('gold','platinum')
-          AND (last_order.last_order_date IS NULL
-               OR last_order.last_order_date < DATE_SUB(NOW(), INTERVAL 90 DAY))
-          AND c.id NOT IN (
-              SELECT DISTINCT s.customer_id
-              FROM sessions s
-              WHERE s.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-                AND s.customer_id IS NOT NULL
-          )
-        ORDER BY days_inactive DESC
+            SELECT pr.customer_id,
+                   COUNT(*) AS review_count,
+                   AVG(pr.rating) AS avg_rating
+            FROM product_reviews pr
+            GROUP BY pr.customer_id
+        ) AS review_stats ON review_stats.customer_id = c.id
+        WHERE payment_stats.avg_fraud_score > 0.1
+           OR payment_stats.failed_payments >= 2
+           OR (order_stats.order_count > 10 AND payment_stats.methods_used >= 3)
+        ORDER BY payment_stats.avg_fraud_score DESC
         LIMIT 50
     """
 
+    # ── Q24: Department budget analysis — cross-level hierarchy ──────────
+    # EXPLAIN: Self-join on departments + employees aggregation + HAVING
+    q24_dept_budget = """
+        SELECT parent_d.name AS division,
+               child_d.name AS department,
+               child_d.budget,
+               emp_stats.headcount,
+               emp_stats.total_salary,
+               emp_stats.avg_salary,
+               emp_stats.total_salary / child_d.budget * 100 AS salary_budget_pct,
+               emp_stats.top_performer_salary,
+               CASE
+                   WHEN emp_stats.total_salary > child_d.budget * 0.9 THEN 'OVER_BUDGET_RISK'
+                   WHEN emp_stats.total_salary > child_d.budget * 0.7 THEN 'ON_TRACK'
+                   ELSE 'UNDER_UTILIZED'
+               END AS budget_status
+        FROM departments parent_d
+        JOIN departments child_d ON child_d.parent_dept_id = parent_d.id
+        JOIN (
+            SELECT e.department_id,
+                   COUNT(*) AS headcount,
+                   SUM(e.salary) AS total_salary,
+                   AVG(e.salary) AS avg_salary,
+                   MAX(CASE WHEN e.performance_score >= 4.5 THEN e.salary END) AS top_performer_salary
+            FROM employees e
+            WHERE e.is_active = 1
+            GROUP BY e.department_id
+            HAVING headcount >= 5
+        ) AS emp_stats ON emp_stats.department_id = child_d.id
+        ORDER BY salary_budget_pct DESC
+    """
+
+    # ── Q25: Promotion effectiveness — full funnel analysis ──────────────
+    # EXPLAIN: 9 tables joined, CASE aggregation, GROUP BY, HAVING, ORDER BY
+    q25_promo_effectiveness = """
+        SELECT promo.code, promo.description,
+               promo.discount_type, promo.discount_value,
+               promo.target_tier, promo.target_category,
+               COUNT(DISTINCT o.id) AS orders_using_promo,
+               COUNT(DISTINCT c.id) AS unique_customers,
+               SUM(o.total_amount) AS total_order_revenue,
+               SUM(op.discount_amount) AS total_discount_given,
+               SUM(o.total_amount) - SUM(op.discount_amount) AS net_revenue,
+               AVG(o.total_amount) AS avg_order_value,
+               SUM(CASE WHEN pt.status = 'captured' THEN pt.amount ELSE 0 END) AS captured_payments,
+               SUM(CASE WHEN pt.status = 'refunded' THEN pt.amount ELSE 0 END) AS refunded_amount,
+               AVG(pr.rating) AS avg_product_rating_on_promo_orders,
+               COUNT(DISTINCT p.category) AS categories_purchased
+        FROM promotions promo
+        JOIN order_promotions op ON op.promotion_id = promo.id
+        JOIN orders o ON o.id = op.order_id
+        JOIN customers c ON c.id = o.customer_id
+        JOIN order_items oi ON oi.order_id = o.id
+        JOIN products p ON p.id = oi.product_id
+        LEFT JOIN payment_transactions pt ON pt.order_id = o.id AND pt.status IN ('captured', 'refunded')
+        LEFT JOIN product_reviews pr ON pr.product_id = p.id AND pr.customer_id = c.id
+        WHERE promo.valid_from >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+        GROUP BY promo.id, promo.code, promo.description,
+                 promo.discount_type, promo.discount_value,
+                 promo.target_tier, promo.target_category
+        HAVING orders_using_promo >= 2
+        ORDER BY net_revenue DESC
+        LIMIT 30
+    """
+
     all_complex_queries = [
-        ("Correlated subqueries (3 levels deep)", subquery_sql, None),
-        ("5-table JOIN + GROUP BY + HAVING", five_join_sql, None),
-        ("Derived tables in FROM", derived_sql, None),
-        ("UNION ALL (3 branches + derived table)", union_sql, None),
-        ("Multi-level GROUP BY + HAVING + CASE", grouping_sql, None),
-        ("Deeply nested subqueries (EXISTS + IN + derived)", nested_sql, None),
-        ("Anti-join (LEFT JOIN + IS NULL + NOT IN)", antijoin_sql, None),
+        ("Q01: Recursive CTE — category hierarchy",           q01_recursive_cte, None),
+        ("Q02: Recursive CTE — management chain",             q02_mgmt_chain, None),
+        ("Q03: 10-table JOIN — full order lifecycle",          q03_ten_table_join, None),
+        ("Q04: Self-join 3 levels — org chart",                q04_self_join_3lvl, None),
+        ("Q05: Semi-join EXISTS — FirstMatch",                 q05_semijoin_exists, None),
+        ("Q06: Semi-join IN — Materialize",                    q06_semijoin_in, None),
+        ("Q07: NOT EXISTS anti-join",                          q07_antijoin, None),
+        ("Q08: Correlated subquery 4 levels deep",             q08_correlated_4deep, None),
+        ("Q09: Window functions (RANK/LAG/LEAD/running)",      q09_window_functions, None),
+        ("Q10: FULLTEXT search + relevance ranking",           q10_fulltext, None),
+        ("Q11: Index merge (intersection)",                    q11_index_merge, None),
+        ("Q12: Covering index scan",                           q12_covering_index, None),
+        ("Q13: UNION ALL 4 branches",                          q13_union_4branch, None),
+        ("Q14: Multi-level aggregation",                       q14_multi_agg, None),
+        ("Q15: Pivot via conditional aggregation",             q15_pivot, None),
+        ("Q16: ALL/ANY subquery comparison",                   q16_all_any, None),
+        ("Q17: Window frame running totals",                   q17_running_totals, None),
+        ("Q18: CASE with scalar subqueries",                   q18_case_subqueries, None),
+        ("Q19: CTE with multiple references",                  q19_cte_multi_ref, None),
+        ("Q20: DML-style complex SELECT",                      q20_update_subquery, None),
+        ("Q21: 8-table supply chain analytics",                q21_supply_chain, None),
+        ("Q22: DEPENDENT UNION — correlated branches",         q22_dependent_union, None),
+        ("Q23: Fraud detection — multi-derived-table",         q23_fraud_detection, None),
+        ("Q24: Dept budget — self-join + HAVING + CASE",       q24_dept_budget, None),
+        ("Q25: Promo effectiveness — 9-table funnel",          q25_promo_effectiveness, None),
     ]
 
     # Run EXPLAIN on all complex queries to populate Dynatrace explain plans
-    log.info("  Running EXPLAIN on 7 complex query patterns...")
+    log.info(f"  Running EXPLAIN on {len(all_complex_queries)} complex query patterns...")
     for label, sql, params in all_complex_queries:
         log.info(f"  --- {label} ---")
         explain_query(conn, sql, params)
@@ -1516,7 +2527,10 @@ def scenario_complex_plans(cfg, iterations=10):
     log.info(f"  Executing complex queries ({iterations} rounds)...")
     for i in range(iterations):
         for label, sql, params in all_complex_queries:
-            execute(conn, sql, params, fetch=True)
+            try:
+                execute(conn, sql, params, fetch=True)
+            except Exception as e:
+                log.debug(f"  Query error ({label}): {e}")
         if i % 3 == 0:
             # Re-run EXPLAIN periodically to keep plans fresh
             for label, sql, params in all_complex_queries:
@@ -1827,7 +2841,14 @@ def main():
             seed_products(conn)
             seed_orders(conn)
             seed_sales_facts(conn)
+            seed_all_new_tables(conn)
         else:
+            # Check if new tables need seeding (upgrade path)
+            new_check = execute(conn, "SELECT COUNT(*) as c FROM employees", fetch=True)
+            new_count = new_check[0]['c'] if new_check else 0
+            if new_count < 100:
+                log.info("Seeding new tables for complex explain plan scenarios...")
+                seed_all_new_tables(conn)
             log.info(f"Existing data found ({count} customers). Use --skip-seed to suppress this check.")
         conn.close()
 
