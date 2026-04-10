@@ -31,7 +31,9 @@ Usage:
 """
 
 import argparse
+import json
 import random
+import re
 import time
 import threading
 import logging
@@ -122,6 +124,268 @@ def explain_query(conn, sql, params=None):
         return []
     finally:
         cur.close()
+
+
+def _sanitize_digest_text(digest_text):
+    """Sanitize performance_schema DIGEST_TEXT so it can be used with EXPLAIN.
+
+    MariaDB normalizes SQL in digest text in ways that break re-execution:
+      - COUNT(DISTINCT x) → COUNT(DISTINCTROW x) — invalid syntax
+      - Spaces inside function calls: COUNT ( * ), SUM ( x )
+      - Backtick quoting everywhere
+      - Parameter markers as literal ?
+    """
+    sql = digest_text
+
+    # Fix DISTINCTROW → DISTINCT (MariaDB digest normalization artifact)
+    sql = re.sub(r'\bDISTINCTROW\b', 'DISTINCT', sql, flags=re.IGNORECASE)
+
+    # Replace ? placeholders with safe literal values.
+    # We need context-aware replacement:
+    #   LIMIT ?  →  LIMIT 10
+    #   LIKE ?   →  LIKE '%a%'
+    #   = ?      →  = 1
+    #   IN (?)   →  IN (1)
+    #   Other ?  →  1
+    def _replace_placeholder(match):
+        before = match.string[:match.start()].rstrip()
+        upper = before.upper()
+        if upper.endswith('LIMIT'):
+            return '10'
+        if upper.endswith('LIKE'):
+            return "'%a%'"
+        if upper.endswith('BETWEEN') or upper.endswith('AND'):
+            return "'2025-01-01'"
+        return '1'
+
+    sql = re.sub(r'\?', _replace_placeholder, sql)
+
+    return sql
+
+
+def process_explain_queue(cfg, batch_size=50):
+    """Process PENDING items in dt_explain_queue by running real EXPLAIN FORMAT=JSON.
+
+    This is the missing piece of the explain plan pipeline:
+      1. Reads PENDING items from dt_explain_queue
+      2. Sanitizes the digest text (fixes MariaDB normalization artifacts)
+      3. Runs EXPLAIN FORMAT=JSON against the actual database
+      4. Parses the JSON plan and extracts key metrics
+      5. Stores the real plan in dt_mariadb_explain_plans
+      6. Updates the queue item status to COMPLETED / FAILED / SKIPPED
+    """
+    log.info("▶ Processing explain plan queue...")
+
+    conn = mysql.connector.connect(
+        host=cfg.host, port=cfg.port,
+        user=cfg.user, password=cfg.password,
+        connection_timeout=30, use_pure=True, autocommit=False,
+    )
+    cur = conn.cursor(dictionary=True)
+
+    # Ensure dt_monitoring database and tables exist
+    try:
+        cur.execute("USE dt_monitoring")
+    except Error:
+        log.warning("  dt_monitoring database does not exist — skipping queue processing")
+        conn.close()
+        return 0
+
+    # Check if queue table exists
+    try:
+        cur.execute("SELECT COUNT(*) as cnt FROM dt_explain_queue WHERE status = 'PENDING'")
+        pending = cur.fetchone()['cnt']
+    except Error:
+        log.warning("  dt_explain_queue table does not exist — skipping")
+        conn.close()
+        return 0
+
+    if pending == 0:
+        log.info("  No pending items in explain queue")
+        conn.close()
+        return 0
+
+    log.info(f"  Found {pending} pending items, processing up to {batch_size}...")
+
+    # Fetch PENDING items
+    cur.execute(
+        "SELECT id, query_digest, query_text, database_name, "
+        "avg_execution_time_ms, total_executions "
+        "FROM dt_explain_queue "
+        "WHERE status = 'PENDING' "
+        "ORDER BY avg_execution_time_ms DESC "
+        "LIMIT %s",
+        (batch_size,)
+    )
+    items = cur.fetchall()
+
+    completed = 0
+    failed = 0
+    skipped = 0
+
+    for item in items:
+        qid = item['id']
+        query_text = item['query_text']
+        db_name = item['database_name'] or cfg.database
+        digest = item['query_digest']
+
+        # Mark as PROCESSING
+        cur.execute(
+            "UPDATE dt_explain_queue SET status = 'PROCESSING', processed_at = NOW() "
+            "WHERE id = %s", (qid,)
+        )
+        conn.commit()
+
+        # Skip non-SELECT queries
+        stripped = query_text.strip().upper()
+        if not stripped.startswith('SELECT'):
+            cur.execute(
+                "UPDATE dt_explain_queue SET status = 'SKIPPED', "
+                "error_message = 'Non-SELECT or system query' WHERE id = %s",
+                (qid,)
+            )
+            conn.commit()
+            skipped += 1
+            continue
+
+        # Skip queries targeting system schemas
+        if any(s in stripped for s in ['PERFORMANCE_SCHEMA', 'INFORMATION_SCHEMA',
+                                       'DT_MONITORING', 'MYSQL.']):
+            cur.execute(
+                "UPDATE dt_explain_queue SET status = 'SKIPPED', "
+                "error_message = 'System schema query' WHERE id = %s",
+                (qid,)
+            )
+            conn.commit()
+            skipped += 1
+            continue
+
+        # Sanitize the digest text for EXPLAIN
+        sanitized_sql = _sanitize_digest_text(query_text)
+
+        try:
+            # Switch to the target database for correct table resolution
+            cur.execute("USE `%s`" % db_name.replace('`', '``'))
+
+            # Run the real EXPLAIN FORMAT=JSON
+            explain_sql = "EXPLAIN FORMAT=JSON " + sanitized_sql
+            cur.execute(explain_sql)
+            row = cur.fetchone()
+            if not row:
+                raise Error("EXPLAIN returned no rows")
+
+            # The result is a single row with a single column named 'EXPLAIN'
+            explain_json_str = list(row.values())[0]
+            explain_data = json.loads(explain_json_str)
+
+            # Extract key metrics from the JSON plan
+            access_type = None
+            rows_estimated = 0
+            filtered_pct = 0.0
+            key_used = None
+            possible_keys = None
+            extra_info = None
+            cost_estimate = None
+            table_name = None
+
+            # Parse the query_block to extract first table's plan details
+            qb = explain_data.get('query_block', {})
+            nested = qb.get('nested_loop', [])
+            if nested:
+                first_table = nested[0]
+                # Handle read_sorted_file wrapper
+                if 'read_sorted_file' in first_table:
+                    fs = first_table['read_sorted_file'].get('filesort', {})
+                    first_table = fs.get('table', first_table)
+                    if not isinstance(first_table, dict) or 'table_name' not in first_table:
+                        first_table = fs
+                tbl = first_table.get('table', first_table)
+                if isinstance(tbl, dict):
+                    access_type = tbl.get('access_type')
+                    rows_estimated = tbl.get('rows', 0)
+                    filtered_pct = tbl.get('filtered', 0.0)
+                    key_used = tbl.get('key')
+                    possible_keys = ', '.join(tbl.get('possible_keys', []) or [])
+                    extra_info = tbl.get('Extra')
+                    table_name = tbl.get('table_name')
+
+            # Also check for filesort at top level
+            if not nested and 'filesort' in qb:
+                fs = qb['filesort']
+                fs_nested = fs.get('nested_loop', fs.get('temporary_table', {}).get('nested_loop', []))
+                if fs_nested:
+                    tbl = fs_nested[0].get('table', {})
+                    access_type = tbl.get('access_type')
+                    rows_estimated = tbl.get('rows', 0)
+                    filtered_pct = tbl.get('filtered', 0.0)
+                    table_name = tbl.get('table_name')
+
+            # Store the real explain plan
+            cur.execute("USE dt_monitoring")
+            cur.execute(
+                "INSERT INTO dt_mariadb_explain_plans ("
+                "  query_digest, query_text, explain_plan_json, "
+                "  table_access_type, rows_estimated, filtered_percentage, "
+                "  key_used, possible_keys, extra_info, cost_estimate, "
+                "  table_name, database_name, "
+                "  avg_execution_time_ms, total_executions"
+                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    digest,
+                    query_text,
+                    explain_json_str,
+                    access_type,
+                    rows_estimated or 0,
+                    filtered_pct or 0.0,
+                    key_used,
+                    possible_keys or None,
+                    extra_info,
+                    cost_estimate,
+                    table_name,
+                    db_name,
+                    item.get('avg_execution_time_ms', 0),
+                    item.get('total_executions', 0),
+                )
+            )
+            explain_plan_id = cur.lastrowid
+
+            # Update queue item as COMPLETED
+            cur.execute(
+                "UPDATE dt_explain_queue SET status = 'COMPLETED', "
+                "explain_plan_id = %s, processed_at = NOW() WHERE id = %s",
+                (explain_plan_id, qid)
+            )
+            conn.commit()
+            completed += 1
+
+            log.debug(f"  ✓ id={qid} type={access_type} rows={rows_estimated} "
+                      f"key={key_used} table={table_name}")
+
+        except (Error, json.JSONDecodeError, Exception) as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            err_msg = str(e)[:500]
+            try:
+                cur.execute("USE dt_monitoring")
+                cur.execute(
+                    "UPDATE dt_explain_queue SET status = 'FAILED', "
+                    "error_message = %s, processed_at = NOW() WHERE id = %s",
+                    (err_msg, qid)
+                )
+                conn.commit()
+            except Exception:
+                pass
+            failed += 1
+            log.debug(f"  ✗ id={qid}: {err_msg[:100]}")
+
+    cur.close()
+    conn.close()
+
+    log.info(f"  Explain queue processed: {completed} completed, {failed} failed, {skipped} skipped")
+    return completed
+
 
 # =============================================================================
 # DYNATRACE MONITORING SETUP
@@ -250,6 +514,20 @@ def setup_dynatrace_monitoring(cfg):
                 log.warning("  ⚠ No digests found yet (will populate when scenarios run)")
         except Error as e:
             log.warning(f"  Could not verify capture: {e}")
+
+    # ── 8. Reset FAILED explain queue items for retry with improved sanitization ─
+    try:
+        cur.execute("USE dt_monitoring")
+        cur.execute(
+            "UPDATE dt_explain_queue SET status = 'PENDING', error_message = NULL "
+            "WHERE status = 'FAILED'"
+        )
+        reset_count = cur.rowcount
+        conn.commit()
+        if reset_count > 0:
+            log.info(f"  ✓ Reset {reset_count} FAILED explain queue items for retry")
+    except Error:
+        pass  # dt_monitoring may not exist yet
 
     cur.close()
     conn.close()
@@ -2784,6 +3062,10 @@ def run_all_scenarios(cfg):
     scenario_heavy_lock_contention(cfg)
 
     oltp_thread.join()
+
+    # Process explain plan queue — runs real EXPLAIN FORMAT=JSON on queued queries
+    process_explain_queue(cfg, batch_size=200)
+
     log.info("=" * 60)
     log.info("  All scenarios complete!")
     log.info("  Check Dynatrace → Databases → dynatrace_demo")
@@ -2797,9 +3079,9 @@ def main():
     parser.add_argument("--password",   default="")
     parser.add_argument("--database",   default="dynatrace_demo")
     parser.add_argument("--scenario",
-        choices=list(ALL_SCENARIOS.keys()) + ["all", "seed", "cleanup"],
+        choices=list(ALL_SCENARIOS.keys()) + ["all", "seed", "cleanup", "process_explains"],
         default="all",
-        help="Scenario to run (default: all)")
+        help="Scenario to run (default: all). Use 'process_explains' to only process the explain queue.")
     parser.add_argument("--skip-seed",  action="store_true",
         help="Skip seeding if data already loaded")
     parser.add_argument("--cleanup-days", type=int, default=10,
@@ -2860,6 +3142,10 @@ def main():
         cleanup_old_data(args, days=args.cleanup_days)
         return
 
+    if args.scenario == "process_explains":
+        process_explain_queue(args, batch_size=500)
+        return
+
     # Optional cleanup before running scenarios
     if args.cleanup_before:
         cleanup_old_data(args, days=args.cleanup_days)
@@ -2869,6 +3155,10 @@ def main():
     else:
         log.info(f"Running: {args.scenario}")
         ALL_SCENARIOS[args.scenario](args)
+
+    # Process explain plan queue after scenarios (unless it was the explicit scenario)
+    if args.scenario != "process_explains":
+        process_explain_queue(args, batch_size=200)
 
     # Optional cleanup after running scenarios
     if args.cleanup_after:
