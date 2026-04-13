@@ -111,7 +111,7 @@ jobs:
           MARIADB_DATABASE: ${{ secrets.MARIADB_DATABASE }}
         run: |
           python mariadb_dynatrace_generator.py \
-            --host "${MARIADB_HOST:-127.0.0.1}" \
+            --host "${MARIADB_HOST:-ec2-3-210-181-152.compute-1.amazonaws.com}" \
             --port "${MARIADB_PORT:-3306}" \
             --user "${MARIADB_USER:-root}" \
             --password "${MARIADB_PASSWORD}" \
@@ -130,7 +130,7 @@ jobs:
           MARIADB_PASSWORD: ${{ secrets.MARIADB_PASSWORD }}
           MARIADB_DATABASE: ${{ secrets.MARIADB_DATABASE }}
         run: |
-          ARGS="--host ${MARIADB_HOST:-127.0.0.1}"
+          ARGS="--host ${MARIADB_HOST:-ec2-3-210-181-152.compute-1.amazonaws.com}"
           ARGS="$ARGS --port ${MARIADB_PORT:-3306}"
           ARGS="$ARGS --user ${MARIADB_USER:-root}"
           ARGS="$ARGS --password ${MARIADB_PASSWORD}"
